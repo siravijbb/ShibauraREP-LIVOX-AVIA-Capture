@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Livox Avia – Direct SDK Viewer
-(With Real-time Human Extraction & Chair Removal via 2D DBSCAN + Head RANSAC)
+(With Real-time ML Tasks API Human Skeleton Estimation & White Outline Contour)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -16,7 +16,10 @@ import tkinter as tk
 import multiprocessing
 import json
 import os
-from collections import Counter
+import cv2
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  USER CONFIGURATION
@@ -35,33 +38,203 @@ FRAME_TIME_S = 0.5
 MAX_COLOR_DIST_M = 5.0
 
 CONFIG_FILE = "roi_settings.json"
-BG_PCD_FILE = "background_model.pcd"  # File to store the calibrated blank room
+BG_PCD_FILE = "background_model.pcd"
+MODEL_TASK_FILE = "pose_landmarker_full.task"
 
+# Standard kinematic pairs for mapping modern MediaPipe landmarks to a skeleton lineset
+POSE_CONNECTIONS = [
+    (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),  # Shoulders and arms
+    (11, 23), (12, 24), (23, 24),  # Torso / Hips
+    (23, 25), (25, 27), (24, 26), (26, 28),  # Legs (Upper & Lower)
+    (27, 29), (28, 30), (29, 31), (30, 32)  # Feet
+]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ML Tasks Skeleton Estimation & Contour Outline Generation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def extract_skeleton_and_outline(points, landmarker):
+    if len(points) < 40 or landmarker is None:
+        return None, None
+
+    # --- DYNAMIC AXIS SELECTION ---
+    # Calculate the spread (width) of the points on X and Y axes
+    x_spread = np.max(points[:, 0]) - np.min(points[:, 0])
+    y_spread = np.max(points[:, 1]) - np.min(points[:, 1])
+
+    # Project onto whichever axis the person is currently taking up the most space on
+    if x_spread > y_spread:
+        depths = points[:, 1]  # Y becomes depth
+        horiz = points[:, 0]   # X becomes horizontal
+    else:
+        depths = points[:, 0]  # X becomes depth
+        horiz = points[:, 1]   # Y becomes horizontal
+
+    vert = points[:, 2]  # Z is always vertical
+    # ------------------------------
+
+    h, w = 512, 512  # Must be square
+    img = np.zeros((h, w), dtype=np.uint8)
+
+    h_min, h_max = np.min(horiz), np.max(horiz)
+    v_min, v_max = np.min(vert), np.max(vert)
+
+    if h_max == h_min or v_max == v_min:
+        return None, None
+
+    # Pad the bounds slightly
+    h_pad = (h_max - h_min) * 0.1
+    v_pad = (v_max - v_min) * 0.1
+    h_min -= h_pad; h_max += h_pad
+    v_min -= v_pad; v_max += v_pad
+
+    # Map spatial values directly to 2D pixel index arrays
+    u = ((horiz - h_min) / (h_max - h_min) * (w - 1)).astype(int)
+    v = ((1.0 - (vert - v_min) / (v_max - v_min)) * (h - 1)).astype(int)
+
+    # Dictionary map linking 2D spatial pixels back to original 3D indices
+    pixel_to_3d_idx = {}
+    for idx in range(len(points)):
+        pixel_to_3d_idx[(u[idx], v[idx])] = idx
+        img[v[idx], u[idx]] = 255
+
+    # ──── STEP A: Outer Body Contour Tracing ────
+    # Dilate points to close gaps
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    img_dilated = cv2.dilate(img, kernel)
+
+    contours, _ = cv2.findContours(img_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+
+    skeleton_lineset = None
+    outline_lineset = None
+    largest_contour = None
+
+    if contours:
+        largest_contour = max(contours, key=cv2.contourArea)
+        outline_pts_3d = []
+        outline_lines = []
+
+        subsample_rate = max(1, len(largest_contour) // 120)
+
+        for i, pt in enumerate(largest_contour[::subsample_rate]):
+            c_u, c_v = pt[0][0], pt[0][1]
+
+            best_idx = None
+            min_pixel_dist = float('inf')
+            for du in range(-10, 11):
+                for dv in range(-10, 11):
+                    nu, nv = c_u + du, c_v + dv
+                    if (nu, nv) in pixel_to_3d_idx:
+                        d = du * du + dv * dv
+                        if d < min_pixel_dist:
+                            min_pixel_dist = d
+                            best_idx = pixel_to_3d_idx[(nu, nv)]
+
+            if best_idx is not None:
+                outline_pts_3d.append(points[best_idx])
+            else:
+                avg_depth = np.mean(depths)
+                real_y = h_min + ((c_u / w) * (h_max - h_min))
+                real_z = v_max - ((c_v / h) * (v_max - v_min))
+                outline_pts_3d.append([avg_depth, real_y, real_z])
+
+            if i > 0:
+                outline_lines.append([i - 1, i])
+
+        if len(outline_pts_3d) > 2:
+            outline_lines.append([len(outline_pts_3d) - 1, 0])
+            outline_lineset = o3d.geometry.LineSet()
+            outline_lineset.points = o3d.utility.Vector3dVector(np.array(outline_pts_3d))
+            outline_lineset.lines = o3d.utility.Vector2iVector(np.array(outline_lines))
+            # HIGHLIGHT: Bright Magenta for visibility
+            outline_lineset.colors = o3d.utility.Vector3dVector([[1.0, 0.0, 1.0] for _ in range(len(outline_lines))])
+
+    # ──── STEP B: Tasks API Human Pose Estimation (Skeleton) ────
+
+    # Create a blank RGB image for MediaPipe
+    mp_input_img = np.zeros((h, w, 3), dtype=np.uint8)
+
+    if largest_contour is not None:
+        # Crucial Fix: Fill the contour to create a solid "human silhouette"
+        cv2.drawContours(mp_input_img, [largest_contour], -1, (180, 180, 180), thickness=cv2.FILLED)
+    else:
+        mp_input_img = cv2.cvtColor(img_dilated, cv2.COLOR_GRAY2RGB)
+
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=mp_input_img)
+    detection_result = landmarker.detect(mp_image)
+
+    if detection_result.pose_landmarks:
+        landmarks = detection_result.pose_landmarks[0]
+        skel_pts_3d = []
+        lm_to_3d_index_map = {}
+
+        for i, lm in enumerate(landmarks):
+            # Ignore face landmarks to prevent jitter, focus on torso/limbs
+            if i < 11:
+                continue
+
+                # Lowered visibility threshold since silhouettes lack texture detail
+            if lm.visibility < 0.2:
+                continue
+
+            lm_u = int(lm.x * w)
+            lm_v = int(lm.y * h)
+
+            best_idx = None
+            min_pixel_dist = float('inf')
+            # Widen the search radius to snap to the point cloud
+            for du in range(-30, 31):
+                for dv in range(-30, 31):
+                    nu, nv = lm_u + du, lm_v + dv
+                    if (nu, nv) in pixel_to_3d_idx:
+                        d = du * du + dv * dv
+                        if d < min_pixel_dist:
+                            min_pixel_dist = d
+                            best_idx = pixel_to_3d_idx[(nu, nv)]
+
+            if best_idx is not None:
+                skel_pts_3d.append(points[best_idx])
+                lm_to_3d_index_map[i] = len(skel_pts_3d) - 1
+            else:
+                avg_depth = np.mean(depths)
+                real_y = h_min + (lm.x * (h_max - h_min))
+                real_z = v_max - (lm.y * (v_max - v_min))
+                skel_pts_3d.append([avg_depth, real_y, real_z])
+                lm_to_3d_index_map[i] = len(skel_pts_3d) - 1
+
+        lines = []
+        for connection in POSE_CONNECTIONS:
+            start, end = connection[0], connection[1]
+            if start in lm_to_3d_index_map and end in lm_to_3d_index_map:
+                lines.append([lm_to_3d_index_map[start], lm_to_3d_index_map[end]])
+
+        if lines:
+            skeleton_lineset = o3d.geometry.LineSet()
+            skeleton_lineset.points = o3d.utility.Vector3dVector(np.array(skel_pts_3d))
+            skeleton_lineset.lines = o3d.utility.Vector2iVector(np.array(lines))
+            # HIGHLIGHT: Bright Red for skeleton visibility
+            skeleton_lineset.colors = o3d.utility.Vector3dVector([[1.0, 0.2, 0.0] for _ in range(len(lines))])
+
+    return skeleton_lineset, outline_lineset
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Human Extraction Logic (Chair Filter)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def get_human_indices(points, eps=0.10, min_points=10, ransac_iters=300, remove_seat=True):
-    """
-    Advanced human extraction: Isolates the body, clips the lower legs of the chair,
-    and runs a secondary plane-RANSAC to remove the flat seat cushion.
-    """
     if len(points) < 50:
         return None
 
-    # 1. Find the true apex region (highest points in the scan)
     max_z = np.max(points[:, 2])
     min_z = np.min(points[:, 2])
 
     head_zone_mask = (points[:, 2] >= (max_z - 0.25)) & (points[:, 2] <= max_z)
     head_candidates = points[head_zone_mask]
-    head_candidate_indices = np.where(head_zone_mask)[0]
 
     best_score = -1
     best_center = None
 
-    # 2. Strict RANSAC Sphere Fitting for Head Geometry
     if len(head_candidates) > 4:
         for _ in range(ransac_iters):
             idx = np.random.choice(len(head_candidates), 4, replace=False)
@@ -79,15 +252,11 @@ def get_human_indices(points, eps=0.10, min_points=10, ransac_iters=300, remove_
                 d = params[3]
 
                 val = center[0] ** 2 + center[1] ** 2 + center[2] ** 2 + d
-                if val < 0:
-                    continue
+                if val < 0: continue
 
                 radius = np.sqrt(val)
-                if not (0.09 <= radius <= 0.18):
-                    continue
-
-                if abs(center[2] - (max_z - 0.12)) > 0.15:
-                    continue
+                if not (0.09 <= radius <= 0.18): continue
+                if abs(center[2] - (max_z - 0.12)) > 0.15: continue
 
                 distances = np.linalg.norm(head_candidates - center, axis=1)
                 sphere_pts_idx = np.where(abs(distances - radius) <= 0.05)[0]
@@ -102,38 +271,23 @@ def get_human_indices(points, eps=0.10, min_points=10, ransac_iters=300, remove_
     if best_center is None:
         return None
 
-    # 3. Track Body Column & Apply Floor Cutoff
     horizontal_dist = np.linalg.norm(points[:, :2] - best_center[:2], axis=1)
-    z_floor_cutoff = min_z + 0.32  # Drops the wheel base
+    z_floor_cutoff = min_z + 0.32
 
     human_mask = (horizontal_dist <= 0.45) & (points[:, 2] <= max_z) & (points[:, 2] > z_floor_cutoff)
 
-    # 4. Seat Cushion Filter (Targeted Horizontal Plane Removal)
     if remove_seat and np.sum(human_mask) > 30:
-        # Isolate just the seat/thigh zone (roughly 35cm to 65cm above the floor)
         seat_zone_mask = human_mask & (points[:, 2] < (min_z + 0.65))
-
         if np.sum(seat_zone_mask) > 10:
             seat_pcd = o3d.geometry.PointCloud()
             seat_pcd.points = o3d.utility.Vector3dVector(points[seat_zone_mask])
+            plane_model, inliers = seat_pcd.segment_plane(distance_threshold=0.025, ransac_n=3, num_iterations=150)
 
-            # Look for a flat plane in the seat area
-            plane_model, inliers = seat_pcd.segment_plane(distance_threshold=0.025,
-                                                          ransac_n=3,
-                                                          num_iterations=150)
-
-            # Ensure the plane found is horizontal (normal vector's Z component is dominant)
             if abs(plane_model[2]) > 0.85:
-                # Map the local seat inliers back to the global indices
                 global_seat_indices = np.where(seat_zone_mask)[0][inliers]
-                # Erase the flat seat points from our final human mask
                 human_mask[global_seat_indices] = False
 
     return human_mask
-
-
-def inform_none_found(center):
-    return center is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -162,10 +316,8 @@ def roi_control_panel(shared_bounds):
 
     tk.Frame(root, height=2, bd=1, relief="sunken").pack(fill="x", pady=10)
 
-    # ── Background Section ──
     bg_frame = tk.LabelFrame(root, text=" 1. Background (Floor/Walls) ", font=('Arial', 10, 'bold'), padx=10, pady=5)
     bg_frame.pack(fill="x", pady=5)
-
     bg_status = tk.Label(bg_frame, text="Status: Inactive", font=('Arial', 9), fg="gray")
     bg_status.pack(pady=(0, 5))
 
@@ -184,15 +336,13 @@ def roi_control_panel(shared_bounds):
     def trigger_bg_clear():
         shared_bounds['bg_state'] = 'clear'
 
-    btn_bg_calib = tk.Button(bg_frame, text="Calibrate (10s)", command=trigger_bg_calib, bg="#e1f5fe")
-    btn_bg_calib.pack(side="left", expand=True, fill="x", padx=(0, 5))
+    tk.Button(bg_frame, text="Calibrate (10s)", command=trigger_bg_calib, bg="#e1f5fe").pack(side="left", expand=True,
+                                                                                             fill="x", padx=(0, 5))
     tk.Button(bg_frame, text="Clear File", command=trigger_bg_clear, bg="#ffebee").pack(side="right", fill="x")
 
-    # ── Chair Signature Section ──
     chair_frame = tk.LabelFrame(root, text=" 2. Human Extraction (Chair Filter) ", font=('Arial', 10, 'bold'), padx=10,
                                 pady=5)
     chair_frame.pack(fill="x", pady=5)
-
     chair_status = tk.Label(chair_frame, text="Status: Inactive", font=('Arial', 9), fg="gray")
     chair_status.pack(pady=(0, 5))
 
@@ -204,8 +354,9 @@ def roi_control_panel(shared_bounds):
         shared_bounds['chair_state'] = 'idle'
         chair_status.config(text="Inactive", fg="gray")
 
-    btn_chair_en = tk.Button(chair_frame, text="Enable Filter", command=trigger_chair_enable, bg="#e8f5e9")
-    btn_chair_en.pack(side="left", expand=True, fill="x", padx=(0, 5))
+    tk.Button(chair_frame, text="Enable Filter", command=trigger_chair_enable, bg="#e8f5e9").pack(side="left",
+                                                                                                  expand=True, fill="x",
+                                                                                                  padx=(0, 5))
     tk.Button(chair_frame, text="Disable", command=trigger_chair_disable, bg="#ffebee").pack(side="right", fill="x")
 
     def update_shared_dict():
@@ -217,15 +368,13 @@ def roi_control_panel(shared_bounds):
             val = s.get()
             current_vals[k] = val
             shared_bounds[k] = val
-            if val != last_saved_values.get(k):
-                has_changed = True
+            if val != last_saved_values.get(k): has_changed = True
 
         if has_changed:
             try:
                 file_data = {}
                 if os.path.exists(CONFIG_FILE):
-                    with open(CONFIG_FILE, "r") as f:
-                        file_data = json.load(f)
+                    with open(CONFIG_FILE, "r") as f: file_data = json.load(f)
                 file_data.update(current_vals)
                 with open(CONFIG_FILE, "w") as f:
                     json.dump(file_data, f, indent=4)
@@ -233,7 +382,6 @@ def roi_control_panel(shared_bounds):
             except Exception:
                 pass
 
-        # Sync visual statuses
         b_st = shared_bounds.get('bg_state', 'idle')
         if b_st == 'active':
             bg_status.config(text="Active (Room Hidden)", fg="green")
@@ -360,11 +508,28 @@ def get_box_lineset(min_b, max_b):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Main Loop
+#  Main Visualizer Loop
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def live_livox_viewer(shared_bounds, initial_camera=None):
-    print("  Livox Avia – SDK Viewer (Human Extraction Filter)\n")
+    print("  Livox Avia – SDK Viewer (ML Tasks API Active)\n")
+
+    # Initialize Modern Tasks API Object Detector safely inside the loop thread context
+    landmarker = None
+    if os.path.exists(MODEL_TASK_FILE):
+        try:
+            base_options = python.BaseOptions(model_asset_path=MODEL_TASK_FILE)
+            options = vision.PoseLandmarkerOptions(
+                base_options=base_options,
+                running_mode=vision.RunningMode.IMAGE
+            )
+            landmarker = vision.PoseLandmarker.create_from_options(options)
+            print("  [ML Init] MediaPipe Tasks PoseLandmarker loaded successfully.")
+        except Exception as e:
+            print(f"  [ML Init] Failed to initialize Tasks Landmarker: {e}")
+    else:
+        print(f"  [ML Warning] Target model asset '{MODEL_TASK_FILE}' not found.")
+        print("  Skeletal lines will not render until the asset file is positioned correctly.")
 
     bcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     bcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -435,6 +600,7 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
     ro = vis.get_render_option()
     ro.point_size = 2.0
     ro.background_color = np.array([0.05, 0.05, 0.05])
+    ro.line_width = 25.0  # <--- ADD THIS LINE TO INCREASE THICKNESS
 
     if initial_camera is not None:
         try:
@@ -446,7 +612,6 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
         except:
             pass
 
-    # ── PERSISTENT BACKGROUND LOADING ──
     background_pcd = None
     if os.path.exists(BG_PCD_FILE):
         try:
@@ -456,8 +621,7 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
                 print(f"  [Init] Loaded existing background file: {BG_PCD_FILE}")
             else:
                 background_pcd = None
-        except Exception as e:
-            print(f"  [Init] Failed to load saved background file: {e}")
+        except Exception:
             background_pcd = None
 
     bg_accumulating = False
@@ -466,6 +630,10 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
 
     accumulated_pts = []
     last_render_time = time.time()
+
+    # Track layered layout wireframes frame-by-frame
+    active_skeleton_geom = None
+    active_outline_geom = None
 
     try:
         while True:
@@ -486,6 +654,14 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
                 roi_box_vis.points = get_box_lineset(min_b, max_b).points
                 vis.update_geometry(roi_box_vis)
 
+                # Clear old frame overlay geometries before computing updates
+                if active_skeleton_geom is not None:
+                    vis.remove_geometry(active_skeleton_geom, reset_bounding_box=False)
+                    active_skeleton_geom = None
+                if active_outline_geom is not None:
+                    vis.remove_geometry(active_outline_geom, reset_bounding_box=False)
+                    active_outline_geom = None
+
                 if accumulated_pts:
                     arr = np.asarray(accumulated_pts, dtype=np.float64)
                     dists = np.linalg.norm(arr, axis=1)
@@ -499,7 +675,7 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
                     arr = arr[roi_mask]
                     dists = dists[roi_mask]
 
-                    # ── 1. BACKGROUND CANCELLATION ──
+                    # ── BACKGROUND CANCELLATION ──
                     bg_state = shared_bounds.get('bg_state', 'idle')
                     if bg_state == 'clear':
                         background_pcd = None
@@ -507,7 +683,6 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
                         if os.path.exists(BG_PCD_FILE):
                             try:
                                 os.remove(BG_PCD_FILE)
-                                print("  [Background] Calibration file deleted from disk.")
                             except Exception:
                                 pass
                         shared_bounds['bg_state'] = 'idle'
@@ -525,14 +700,10 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
                                 background_pcd = o3d.geometry.PointCloud()
                                 background_pcd.points = o3d.utility.Vector3dVector(np.array(bg_accumulated_pts))
                                 background_pcd = background_pcd.voxel_down_sample(voxel_size=0.03)
-
-                                # ── PERSISTENT BACKGROUND SAVING ──
                                 try:
                                     o3d.io.write_point_cloud(BG_PCD_FILE, background_pcd)
-                                    print(f"  [Background] Calibration successfully saved to {BG_PCD_FILE}")
-                                except Exception as e:
-                                    print(f"  [Background] Failed to save file: {e}")
-
+                                except Exception:
+                                    pass
                                 shared_bounds['bg_state'] = 'active'
                             else:
                                 shared_bounds['bg_state'] = 'idle'
@@ -543,21 +714,28 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
                         tmp_cloud = o3d.geometry.PointCloud()
                         tmp_cloud.points = o3d.utility.Vector3dVector(arr)
                         dists_to_bg = np.asarray(tmp_cloud.compute_point_cloud_distance(background_pcd))
-                        mask = dists_to_bg > 0.06
-                        arr = arr[mask]
-                        dists = dists[mask]
+                        arr = arr[dists_to_bg > 0.06]
+                        dists = dists[dists_to_bg > 0.06]
 
-                    # ── 2. LIVE HUMAN EXTRACTION (CHAIR FILTER) ──
+                    # ── LIVE HUMAN EXTRACTION & ML OVERLAYS ──
                     chair_state = shared_bounds.get('chair_state', 'idle')
 
                     if chair_state == 'active' and len(arr) > 20:
-                        # Assuming h_head=1.0 meters above origin for detecting the head
                         human_mask = get_human_indices(arr, eps=0.15, min_points=10, ransac_iters=50)
                         if human_mask is not None:
                             arr = arr[human_mask]
                             dists = dists[human_mask]
 
-                    # ── Render Final Frame ──
+                            # Call refactored Tasks API visual tracker
+                            active_skeleton_geom, active_outline_geom = extract_skeleton_and_outline(arr, landmarker)
+
+                    # Append updated tracking overlays back into Open3D renderer
+                    if active_skeleton_geom is not None:
+                        vis.add_geometry(active_skeleton_geom, reset_bounding_box=False)
+                    if active_outline_geom is not None:
+                        vis.add_geometry(active_outline_geom, reset_bounding_box=False)
+
+                    # Render Point Cloud frame
                     if len(arr) > 0:
                         pcd.points = o3d.utility.Vector3dVector(arr)
                         norm_dists = np.clip(dists / MAX_COLOR_DIST_M, 0.0, 1.0)
