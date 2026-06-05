@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Livox Avia – Direct SDK Viewer (The True Protocol Fix)
+Livox Avia – Direct SDK Viewer (With Persistent Live ROI Controls)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -11,6 +11,10 @@ import time
 import numpy as np
 import open3d as o3d
 import binascii
+import tkinter as tk
+import multiprocessing
+import json
+import os
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  USER CONFIGURATION
@@ -25,19 +29,71 @@ HOST_IMU_PORT = 60002
 
 HEARTBEAT_INTERVAL_S = 1.0
 
-# --- NEW VISUALIZATION SETTINGS ---
-FRAME_TIME_S = 0.5  # Accumulate points over this duration (0.1s = 10 FPS)
-MAX_COLOR_DIST_M = 5.0  # Maximum distance for the color gradient (meters)
+FRAME_TIME_S = 0.5
+MAX_COLOR_DIST_M = 5.0
+
+CONFIG_FILE = "roi_settings.json"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  GUI Control Panel Process (With Auto-Save)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# ───────────────────────────────────────────────────────────────────────────────
-#  The Correct LSB-First CRCs
-# ───────────────────────────────────────────────────────────────────────────────
+def roi_control_panel(shared_bounds):
+    """Runs a Tkinter window in a separate process to avoid blocking Open3D."""
+    root = tk.Tk()
+    root.title("ROI Control Panel")
+    root.geometry("320x450")
+    root.attributes('-topmost', True)  # Keeps the window floating above Open3D
+    root.configure(padx=15, pady=15)
+
+    tk.Label(root, text="Adjust ROI Bounding Box", font=('Arial', 12, 'bold')).pack(pady=(0, 10))
+
+    def make_slider(name, val):
+        tk.Label(root, text=f"{name} Axis", font=('Arial', 9, 'bold'), fg="gray").pack(anchor='w', pady=(5, 0))
+        s = tk.Scale(root, from_=-20.0, to=20.0, resolution=0.1, orient='horizontal', length=280)
+        s.set(val)
+        s.pack()
+        return s
+
+    sliders = {k: make_slider(k, v) for k, v in shared_bounds.items()}
+
+    # Initialize tracking dictionary to avoid heavy redundant disk writes
+    last_saved_values = {k: s.get() for k, s in sliders.items()}
+
+    def update_shared_dict():
+        nonlocal last_saved_values
+        current_vals = {}
+        has_changed = False
+
+        # Pull values from UI sliders to shared memory
+        for k, s in sliders.items():
+            val = s.get()
+            current_vals[k] = val
+            shared_bounds[k] = val
+            if val != last_saved_values.get(k):
+                has_changed = True
+
+        # Save to file immediately if any slider was moved
+        if has_changed:
+            try:
+                with open(CONFIG_FILE, "w") as f:
+                    json.dump(current_vals, f, indent=4)
+                last_saved_values = current_vals
+            except Exception as e:
+                print(f"Error auto-saving settings: {e}")
+
+        root.after(50, update_shared_dict)
+
+    update_shared_dict()
+    root.mainloop()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Protocol & Parsing
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def livox_crc16(data: bytes) -> int:
-    """Standard LSB-first CRC16 with poly 0x8408 (reversed 0x1021) and Init 0x4C49"""
     crc = 0x4C49
     for b in data:
         crc ^= b
@@ -50,13 +106,8 @@ def livox_crc16(data: bytes) -> int:
 
 
 def livox_crc32(data: bytes) -> int:
-    """Standard LSB-first CRC32 using binascii, with Livox's custom Init 0x564F580A"""
     return binascii.crc32(data, 0x564F580A) & 0xFFFFFFFF
 
-
-# ───────────────────────────────────────────────────────────────────────────────
-#  Command packet builder
-# ───────────────────────────────────────────────────────────────────────────────
 
 _seq_num = 0
 
@@ -68,63 +119,37 @@ def _next_seq() -> int:
 
 
 def build_cmd(cmd_set: int, cmd_id: int, payload: bytes = b'', cmd_type: int = 0x00) -> bytes:
-    """Build a Livox SDK command packet."""
     data = bytes([cmd_set, cmd_id]) + payload
     total_len = 9 + len(data) + 4
-
-    # Header: SOF, Version, Length, CmdType, Seq
     pre_crc = struct.pack('<BBHBH', 0xAA, 0x01, total_len, cmd_type, _next_seq())
-
-    # Header CRC16
     header = pre_crc + struct.pack('<H', livox_crc16(pre_crc))
-
-    # Payload
     packet_without_crc32 = header + data
-
-    # Packet CRC32
     crc32_val = livox_crc32(packet_without_crc32)
-
     return packet_without_crc32 + struct.pack('<I', crc32_val)
 
 
-# ───────────────────────────────────────────────────────────────────────────────
-#  Standard commands
-# ───────────────────────────────────────────────────────────────────────────────
-
 def cmd_handshake(host_ip: str, data_port: int, cmd_port: int, imu_port: int) -> bytes:
-    """
-    CRITICAL FIX: Handshake MUST be cmd_type=0x01 (ACK) as it responds to Broadcast.
-    """
     payload = socket.inet_aton(host_ip) + struct.pack('<HHH', data_port, cmd_port, imu_port)
     return build_cmd(0x00, 0x01, payload, cmd_type=0x01)
 
 
 def cmd_heartbeat() -> bytes:
-    """CMD_SET=0x00, CMD_ID=0x03 – keep-alive (Defaults to Request 0x00)."""
     return build_cmd(0x00, 0x03)
 
 
 def cmd_start_sampling(start: bool = True) -> bytes:
-    """CMD_SET=0x00, CMD_ID=0x04 – start/stop streaming (Defaults to Request 0x00)."""
     return build_cmd(0x00, 0x04, bytes([0x01 if start else 0x00]))
 
 
 def cmd_set_cartesian() -> bytes:
-    """CMD_SET=0x00, CMD_ID=0x05 – request Cartesian output (Defaults to Request 0x00)."""
     return build_cmd(0x00, 0x05, bytes([0x00]))
 
-
-# ───────────────────────────────────────────────────────────────────────────────
-#  Point cloud parser
-# ───────────────────────────────────────────────────────────────────────────────
 
 _DATA_HDR = 18
 
 
 def parse_data_packet(data: bytes) -> list:
-    if len(data) < _DATA_HDR + 1:
-        return []
-    if data[0] == 0xAA:
+    if len(data) < _DATA_HDR + 1 or data[0] == 0xAA:
         return []
 
     dtype = data[9]
@@ -146,9 +171,7 @@ def parse_data_packet(data: bytes) -> list:
             r = depth * 1e-3
             ze = np.radians(theta / 100.0)
             az = np.radians(phi / 100.0)
-            pts.append([r * np.sin(ze) * np.cos(az),
-                        r * np.sin(ze) * np.sin(az),
-                        r * np.cos(ze)])
+            pts.append([r * np.sin(ze) * np.cos(az), r * np.sin(ze) * np.sin(az), r * np.cos(ze)])
             offset += 9
     elif dtype == 2:
         n = (len(data) - _DATA_HDR) // 14
@@ -159,10 +182,6 @@ def parse_data_packet(data: bytes) -> list:
             offset += 14
     return pts
 
-
-# ───────────────────────────────────────────────────────────────────────────────
-#  Helpers
-# ───────────────────────────────────────────────────────────────────────────────
 
 def send_and_ack(sock, pkt: bytes, dest: tuple, label: str, timeout: float = 2.0):
     sock.sendto(pkt, dest)
@@ -178,21 +197,35 @@ def send_and_ack(sock, pkt: bytes, dest: tuple, label: str, timeout: float = 2.0
         return None
 
 
-# ───────────────────────────────────────────────────────────────────────────────
-#  Main
-# ───────────────────────────────────────────────────────────────────────────────
+def get_box_lineset(min_b, max_b):
+    """Creates a wireframe Open3D geometry representing the bounding box."""
+    points = [
+        [min_b[0], min_b[1], min_b[2]], [max_b[0], min_b[1], min_b[2]],
+        [min_b[0], max_b[1], min_b[2]], [max_b[0], max_b[1], min_b[2]],
+        [min_b[0], min_b[1], max_b[2]], [max_b[0], min_b[1], max_b[2]],
+        [min_b[0], max_b[1], max_b[2]], [max_b[0], max_b[1], max_b[2]],
+    ]
+    lines = [[0, 1], [0, 2], [1, 3], [2, 3], [4, 5], [4, 6], [5, 7], [6, 7], [0, 4], [1, 5], [2, 6], [3, 7]]
+    colors = [[1, 0.2, 0.2] for _ in range(12)]
 
-def live_livox_viewer():
+    ls = o3d.geometry.LineSet()
+    ls.points = o3d.utility.Vector3dVector(points)
+    ls.lines = o3d.utility.Vector2iVector(lines)
+    ls.colors = o3d.utility.Vector3dVector(colors)
+    return ls
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Main Loop
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def live_livox_viewer(shared_bounds):
     sep = "─" * 62
     print(sep)
-    print("  Livox Avia – Direct SDK Viewer (The True Protocol Fix)")
-    print(sep)
-    print("  ⚠  Make sure Livox Viewer is fully closed.")
+    print("  Livox Avia – Direct SDK Viewer (Live ROI Controls)")
     print(sep + "\n")
 
-    # ── Step 1: Capture device broadcast ─────────────────────────────────────
     print(f"[1/4] Waiting for device broadcast on port {BROADCAST_PORT}...")
-
     bcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     bcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     bcast_sock.bind(("0.0.0.0", BROADCAST_PORT))
@@ -208,29 +241,19 @@ def live_livox_viewer():
                 return
 
             if (len(raw) >= 34 and raw[0] == 0xAA and raw[9] == 0x00 and raw[10] == 0x00):
-                bcast_code = raw[11:27].decode('ascii', errors='replace').rstrip('\x00')
                 device_ip = addr[0]
                 print(f"  Device found   : {device_ip}")
-                print(f"  Broadcast code : {bcast_code}")
     finally:
         bcast_sock.close()
 
-    # ── Step 2: Handshake ─────────────────────────────────────────────────────
     dest = (device_ip, DEVICE_CMD_PORT)
-
-    # Dynamically find the correct network adapter IP for the LiDAR
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.connect((device_ip, 1))
         host_ip = s.getsockname()[0]
 
     print(f"\n[2/4] Handshake  (this host = {host_ip})")
-
     cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        cmd_sock.bind((host_ip, HOST_CMD_PORT))
-    except OSError as e:
-        print(f"  ERROR: cannot bind cmd socket to {host_ip}:{HOST_CMD_PORT}: {e}")
-        return
+    cmd_sock.bind((host_ip, HOST_CMD_PORT))
 
     hs_pkt = cmd_handshake(host_ip, HOST_DATA_PORT, HOST_CMD_PORT, HOST_IMU_PORT)
     send_and_ack(cmd_sock, hs_pkt, dest, "Handshake")
@@ -238,7 +261,6 @@ def live_livox_viewer():
     send_and_ack(cmd_sock, cmd_set_cartesian(), dest, "Set Cartesian coords")
     time.sleep(0.05)
 
-    # ── Step 3: Start sampling ────────────────────────────────────────────────
     print(f"\n[3/4] Starting data stream...")
     send_and_ack(cmd_sock, cmd_start_sampling(True), dest, "Start sampling")
 
@@ -261,23 +283,17 @@ def live_livox_viewer():
     hb_thread = threading.Thread(target=_heartbeat, daemon=True)
     hb_thread.start()
 
-    # ── Step 4: Data socket ───────────────────────────────────────────────────
     data_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     data_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        data_sock.bind((host_ip, HOST_DATA_PORT))
-    except OSError as e:
-        print(f"\n  ERROR: cannot bind data socket to {host_ip}:{HOST_DATA_PORT}: {e}")
-        stop_event.set()
-        cmd_sock.close()
-        return
+    data_sock.bind((host_ip, HOST_DATA_PORT))
     data_sock.setblocking(False)
 
-    print(f"\n[4/4] Listening for point cloud on port {HOST_DATA_PORT}...")
-    print(f"      Frame Time: {FRAME_TIME_S}s | Max Color Dist: {MAX_COLOR_DIST_M}m")
-    print("      Press Ctrl+C to stop.\n")
+    print(f"\n[4/4] Rendering Live Stream...")
+    print("      Use the popup panel to adjust the ROI bounding box.")
+    print("      Settings are saved automatically on change!")
+    print("      Press Ctrl+C in the terminal to stop.\n")
 
-    # ── Open3D window ──────────────────────────────────────────────────────────
+    # ── Open3D window ──
     vis = o3d.visualization.Visualizer()
     vis.create_window("Livox Avia – Direct", 1280, 720)
 
@@ -286,77 +302,74 @@ def live_livox_viewer():
     vis.add_geometry(pcd)
     vis.add_geometry(o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0))
 
+    # Grab snapshot bounding box to generate initial LineSet
+    init_min = [min(shared_bounds['X1'], shared_bounds['X2']), min(shared_bounds['Y1'], shared_bounds['Y2']),
+                min(shared_bounds['Z1'], shared_bounds['Z2'])]
+    init_max = [max(shared_bounds['X1'], shared_bounds['X2']), max(shared_bounds['Y1'], shared_bounds['Y2']),
+                max(shared_bounds['Z1'], shared_bounds['Z2'])]
+    roi_box_vis = get_box_lineset(init_min, init_max)
+    vis.add_geometry(roi_box_vis)
+
     ro = vis.get_render_option()
     ro.point_size = 1.5
     ro.background_color = np.array([0.05, 0.05, 0.05])
 
-    vis.poll_events()
-    vis.update_renderer()
-
-    # ── Render loop ────────────────────────────────────────────────────────────
-    total_pkts = 0
     accumulated_pts = []
     last_render_time = time.time()
 
     try:
         while True:
-            # Drain all available UDP packets from the OS buffer
             while True:
                 try:
                     pkt, _ = data_sock.recvfrom(1500)
+                    accumulated_pts.extend(parse_data_packet(pkt))
                 except (BlockingIOError, OSError):
-                    break  # Buffer is empty for now
+                    break
 
-                if total_pkts == 0:
-                    print(f"  First DATA packet: len={len(pkt)} "
-                          f"version=0x{pkt[0]:02X} data_type=0x{pkt[9]:02X}")
-                total_pkts += 1
-                if total_pkts % 2000 == 0:
-                    print(f"  {total_pkts} data packets received...")
-
-                accumulated_pts.extend(parse_data_packet(pkt))
-
-            # Check if it is time to render the accumulated frame
             current_time = time.time()
             if current_time - last_render_time >= FRAME_TIME_S:
+                min_b = [min(shared_bounds['X1'], shared_bounds['X2']), min(shared_bounds['Y1'], shared_bounds['Y2']),
+                         min(shared_bounds['Z1'], shared_bounds['Z2'])]
+                max_b = [max(shared_bounds['X1'], shared_bounds['X2']), max(shared_bounds['Y1'], shared_bounds['Y2']),
+                         max(shared_bounds['Z1'], shared_bounds['Z2'])]
+
+                new_box = get_box_lineset(min_b, max_b)
+                roi_box_vis.points = new_box.points
+                vis.update_geometry(roi_box_vis)
+
                 if accumulated_pts:
                     arr = np.asarray(accumulated_pts, dtype=np.float64)
-
-                    # Calculate distances
                     dists = np.linalg.norm(arr, axis=1)
 
-                    # Filter out zero-points (origin noise)
-                    valid_mask = dists > 0.01
-                    arr = arr[valid_mask]
-                    dists = dists[valid_mask]
+                    roi_mask = (
+                            (dists > 0.01) &
+                            (arr[:, 0] >= min_b[0]) & (arr[:, 0] <= max_b[0]) &
+                            (arr[:, 1] >= min_b[1]) & (arr[:, 1] <= max_b[1]) &
+                            (arr[:, 2] >= min_b[2]) & (arr[:, 2] <= max_b[2])
+                    )
+
+                    arr = arr[roi_mask]
+                    dists = dists[roi_mask]
 
                     if len(arr) > 0:
                         pcd.points = o3d.utility.Vector3dVector(arr)
-
-                        # --- Pure NumPy "Jet" Colormap generation ---
-                        # Normalize distances from 0.0 to 1.0
                         norm_dists = np.clip(dists / MAX_COLOR_DIST_M, 0.0, 1.0)
-
                         colors = np.zeros((len(arr), 3))
-                        # R channel
                         colors[:, 0] = np.clip(1.5 - np.abs(4.0 * norm_dists - 3.0), 0, 1)
-                        # G channel
                         colors[:, 1] = np.clip(1.5 - np.abs(4.0 * norm_dists - 2.0), 0, 1)
-                        # B channel
                         colors[:, 2] = np.clip(1.5 - np.abs(4.0 * norm_dists - 1.0), 0, 1)
-
                         pcd.colors = o3d.utility.Vector3dVector(colors)
                         vis.update_geometry(pcd)
+                    else:
+                        pcd.points = o3d.utility.Vector3dVector(np.zeros((0, 3)))
+                        pcd.colors = o3d.utility.Vector3dVector(np.zeros((0, 3)))
+                        vis.update_geometry(pcd)
 
-                # Reset accumulator and timestamp
                 accumulated_pts.clear()
                 last_render_time = current_time
 
-            # Update UI to keep the window responsive
             vis.poll_events()
             vis.update_renderer()
-
-            # Yield CPU to prevent locking up a core at 100%
             time.sleep(0.001)
 
     except KeyboardInterrupt:
@@ -368,12 +381,40 @@ def live_livox_viewer():
             cmd_sock.sendto(cmd_start_sampling(False), dest)
         except Exception:
             pass
-        time.sleep(0.1)
         cmd_sock.close()
         data_sock.close()
         vis.destroy_window()
-        print("Done.")
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Multiprocessing Entry Point
+# ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    live_livox_viewer()
+    multiprocessing.freeze_support()
+
+    # Check if a configuration file already exists from a previous run
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                initial_bounds = json.load(f)
+            print(f"-> Loaded existing ROI config from {CONFIG_FILE}")
+        except Exception:
+            print("-> Found corrupted config file. Loading defaults.")
+            initial_bounds = {'X1': -5.0, 'X2': 5.0, 'Y1': -5.0, 'Y2': 5.0, 'Z1': -2.0, 'Z2': 5.0}
+    else:
+        # Defaults if no config file exists yet
+        initial_bounds = {'X1': -5.0, 'X2': 5.0, 'Y1': -5.0, 'Y2': 5.0, 'Z1': -2.0, 'Z2': 5.0}
+
+    with multiprocessing.Manager() as manager:
+        shared_bounds = manager.dict(initial_bounds)
+
+        # Start slider interface
+        gui_process = multiprocessing.Process(target=roi_control_panel, args=(shared_bounds,))
+        gui_process.start()
+
+        try:
+            live_livox_viewer(shared_bounds)
+        finally:
+            gui_process.terminate()
+            gui_process.join()
