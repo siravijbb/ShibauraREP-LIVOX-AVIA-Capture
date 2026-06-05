@@ -25,6 +25,10 @@ HOST_IMU_PORT = 60002
 
 HEARTBEAT_INTERVAL_S = 1.0
 
+# --- NEW VISUALIZATION SETTINGS ---
+FRAME_TIME_S = 0.5  # Accumulate points over this duration (0.1s = 10 FPS)
+MAX_COLOR_DIST_M = 5.0  # Maximum distance for the color gradient (meters)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -270,6 +274,7 @@ def live_livox_viewer():
     data_sock.setblocking(False)
 
     print(f"\n[4/4] Listening for point cloud on port {HOST_DATA_PORT}...")
+    print(f"      Frame Time: {FRAME_TIME_S}s | Max Color Dist: {MAX_COLOR_DIST_M}m")
     print("      Press Ctrl+C to stop.\n")
 
     # ── Open3D window ──────────────────────────────────────────────────────────
@@ -290,14 +295,17 @@ def live_livox_viewer():
 
     # ── Render loop ────────────────────────────────────────────────────────────
     total_pkts = 0
+    accumulated_pts = []
+    last_render_time = time.time()
+
     try:
         while True:
-            pts = []
-            for _ in range(200):
+            # Drain all available UDP packets from the OS buffer
+            while True:
                 try:
                     pkt, _ = data_sock.recvfrom(1500)
                 except (BlockingIOError, OSError):
-                    break
+                    break  # Buffer is empty for now
 
                 if total_pkts == 0:
                     print(f"  First DATA packet: len={len(pkt)} "
@@ -306,18 +314,50 @@ def live_livox_viewer():
                 if total_pkts % 2000 == 0:
                     print(f"  {total_pkts} data packets received...")
 
-                pts.extend(parse_data_packet(pkt))
+                accumulated_pts.extend(parse_data_packet(pkt))
 
-            if pts:
-                arr = np.asarray(pts, dtype=np.float64)
-                arr = arr[np.linalg.norm(arr, axis=1) > 0.01]
-                if len(arr):
-                    pcd.points = o3d.utility.Vector3dVector(arr)
-                    pcd.paint_uniform_color([0.1, 0.9, 0.2])
-                    vis.update_geometry(pcd)
+            # Check if it is time to render the accumulated frame
+            current_time = time.time()
+            if current_time - last_render_time >= FRAME_TIME_S:
+                if accumulated_pts:
+                    arr = np.asarray(accumulated_pts, dtype=np.float64)
 
+                    # Calculate distances
+                    dists = np.linalg.norm(arr, axis=1)
+
+                    # Filter out zero-points (origin noise)
+                    valid_mask = dists > 0.01
+                    arr = arr[valid_mask]
+                    dists = dists[valid_mask]
+
+                    if len(arr) > 0:
+                        pcd.points = o3d.utility.Vector3dVector(arr)
+
+                        # --- Pure NumPy "Jet" Colormap generation ---
+                        # Normalize distances from 0.0 to 1.0
+                        norm_dists = np.clip(dists / MAX_COLOR_DIST_M, 0.0, 1.0)
+
+                        colors = np.zeros((len(arr), 3))
+                        # R channel
+                        colors[:, 0] = np.clip(1.5 - np.abs(4.0 * norm_dists - 3.0), 0, 1)
+                        # G channel
+                        colors[:, 1] = np.clip(1.5 - np.abs(4.0 * norm_dists - 2.0), 0, 1)
+                        # B channel
+                        colors[:, 2] = np.clip(1.5 - np.abs(4.0 * norm_dists - 1.0), 0, 1)
+
+                        pcd.colors = o3d.utility.Vector3dVector(colors)
+                        vis.update_geometry(pcd)
+
+                # Reset accumulator and timestamp
+                accumulated_pts.clear()
+                last_render_time = current_time
+
+            # Update UI to keep the window responsive
             vis.poll_events()
             vis.update_renderer()
+
+            # Yield CPU to prevent locking up a core at 100%
+            time.sleep(0.001)
 
     except KeyboardInterrupt:
         print("\nStopping...")
