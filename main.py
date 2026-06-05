@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Livox Avia – Direct SDK Viewer (With Live ROI & Background Cancellation)
+Livox Avia – Direct SDK Viewer
+(With Real-time Human Extraction & Chair Removal via 2D DBSCAN + Head RANSAC)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -15,6 +16,7 @@ import tkinter as tk
 import multiprocessing
 import json
 import os
+from collections import Counter
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  USER CONFIGURATION
@@ -33,6 +35,105 @@ FRAME_TIME_S = 0.5
 MAX_COLOR_DIST_M = 5.0
 
 CONFIG_FILE = "roi_settings.json"
+BG_PCD_FILE = "background_model.pcd"  # File to store the calibrated blank room
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Human Extraction Logic (Chair Filter)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_human_indices(points, eps=0.10, min_points=10, ransac_iters=300, remove_seat=True):
+    """
+    Advanced human extraction: Isolates the body, clips the lower legs of the chair,
+    and runs a secondary plane-RANSAC to remove the flat seat cushion.
+    """
+    if len(points) < 50:
+        return None
+
+    # 1. Find the true apex region (highest points in the scan)
+    max_z = np.max(points[:, 2])
+    min_z = np.min(points[:, 2])
+
+    head_zone_mask = (points[:, 2] >= (max_z - 0.25)) & (points[:, 2] <= max_z)
+    head_candidates = points[head_zone_mask]
+    head_candidate_indices = np.where(head_zone_mask)[0]
+
+    best_score = -1
+    best_center = None
+
+    # 2. Strict RANSAC Sphere Fitting for Head Geometry
+    if len(head_candidates) > 4:
+        for _ in range(ransac_iters):
+            idx = np.random.choice(len(head_candidates), 4, replace=False)
+            pts = head_candidates[idx]
+
+            A = np.zeros((4, 4))
+            b = np.zeros(4)
+            for i in range(4):
+                A[i] = [2 * pts[i][0], 2 * pts[i][1], 2 * pts[i][2], 1]
+                b[i] = pts[i][0] ** 2 + pts[i][1] ** 2 + pts[i][2] ** 2
+
+            try:
+                params = np.linalg.solve(A, b)
+                center = params[:3]
+                d = params[3]
+
+                val = center[0] ** 2 + center[1] ** 2 + center[2] ** 2 + d
+                if val < 0:
+                    continue
+
+                radius = np.sqrt(val)
+                if not (0.09 <= radius <= 0.18):
+                    continue
+
+                if abs(center[2] - (max_z - 0.12)) > 0.15:
+                    continue
+
+                distances = np.linalg.norm(head_candidates - center, axis=1)
+                sphere_pts_idx = np.where(abs(distances - radius) <= 0.05)[0]
+
+                score = len(sphere_pts_idx)
+                if score > best_score:
+                    best_score = score
+                    best_center = center
+            except np.linalg.LinAlgError:
+                continue
+
+    if best_center is None:
+        return None
+
+    # 3. Track Body Column & Apply Floor Cutoff
+    horizontal_dist = np.linalg.norm(points[:, :2] - best_center[:2], axis=1)
+    z_floor_cutoff = min_z + 0.32  # Drops the wheel base
+
+    human_mask = (horizontal_dist <= 0.45) & (points[:, 2] <= max_z) & (points[:, 2] > z_floor_cutoff)
+
+    # 4. Seat Cushion Filter (Targeted Horizontal Plane Removal)
+    if remove_seat and np.sum(human_mask) > 30:
+        # Isolate just the seat/thigh zone (roughly 35cm to 65cm above the floor)
+        seat_zone_mask = human_mask & (points[:, 2] < (min_z + 0.65))
+
+        if np.sum(seat_zone_mask) > 10:
+            seat_pcd = o3d.geometry.PointCloud()
+            seat_pcd.points = o3d.utility.Vector3dVector(points[seat_zone_mask])
+
+            # Look for a flat plane in the seat area
+            plane_model, inliers = seat_pcd.segment_plane(distance_threshold=0.025,
+                                                          ransac_n=3,
+                                                          num_iterations=150)
+
+            # Ensure the plane found is horizontal (normal vector's Z component is dominant)
+            if abs(plane_model[2]) > 0.85:
+                # Map the local seat inliers back to the global indices
+                global_seat_indices = np.where(seat_zone_mask)[0][inliers]
+                # Erase the flat seat points from our final human mask
+                human_mask[global_seat_indices] = False
+
+    return human_mask
+
+
+def inform_none_found(center):
+    return center is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -40,10 +141,9 @@ CONFIG_FILE = "roi_settings.json"
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def roi_control_panel(shared_bounds):
-    """Runs a Tkinter window in a separate process to avoid blocking Open3D."""
     root = tk.Tk()
     root.title("ROI & Background Panel")
-    root.geometry("340x560")
+    root.geometry("360x680")
     root.attributes('-topmost', True)
     root.configure(padx=15, pady=15)
 
@@ -56,58 +156,57 @@ def roi_control_panel(shared_bounds):
         s.pack()
         return s
 
-    # Ensure we only generate sliders for spatial keys
     spatial_keys = ['X1', 'X2', 'Y1', 'Y2', 'Z1', 'Z2']
     sliders = {k: make_slider(k, shared_bounds[k]) for k in spatial_keys}
     last_saved_values = {k: s.get() for k, s in sliders.items()}
 
-    # ── Background Subtraction UI Section ──
-    tk.Frame(root, height=2, bd=1, relief="sunken").pack(fill="x", pady=15)
+    tk.Frame(root, height=2, bd=1, relief="sunken").pack(fill="x", pady=10)
 
-    bg_frame = tk.LabelFrame(root, text=" Background Cancellation ", font=('Arial', 10, 'bold'), padx=10, pady=10)
-    bg_frame.pack(fill="x")
+    # ── Background Section ──
+    bg_frame = tk.LabelFrame(root, text=" 1. Background (Floor/Walls) ", font=('Arial', 10, 'bold'), padx=10, pady=5)
+    bg_frame.pack(fill="x", pady=5)
 
-    # FIXED: Changed 'medium' to 'normal'
-    status_label = tk.Label(bg_frame, text="Status: Inactive", font=('Arial', 10, 'normal'), fg="gray")
-    status_label.pack(pady=(0, 8))
+    bg_status = tk.Label(bg_frame, text="Status: Inactive", font=('Arial', 9), fg="gray")
+    bg_status.pack(pady=(0, 5))
 
-    def run_countdown(count):
+    def run_bg_countdown(count):
         if count > 0:
             shared_bounds['bg_state'] = 'countdown'
-            status_label.config(text=f"Calibrating in {count}s...", fg="orange")
-            root.after(1000, run_countdown, count - 1)
+            bg_status.config(text=f"Calibrating in {count}s...", fg="orange")
+            root.after(1000, run_bg_countdown, count - 1)
         else:
-            status_label.config(text="Scanning environment (Keep clear)...", fg="blue")
+            bg_status.config(text="Scanning empty room...", fg="blue")
             shared_bounds['bg_state'] = 'capture'
-            monitor_capture()
 
-    def monitor_capture():
-        state = shared_bounds['bg_state']
-        if state == 'active':
-            status_label.config(text="Status: Subtraction Active", fg="green")
-            btn_calibrate.config(state='normal')
-            btn_clear.config(state='normal')
-        elif state == 'idle':
-            status_label.config(text="Status: Inactive", fg="gray")
-            btn_calibrate.config(state='normal')
-        else:
-            root.after(200, monitor_capture)
+    def trigger_bg_calib():
+        run_bg_countdown(10)
 
-    def trigger_calibration():
-        btn_calibrate.config(state='disabled')
-        btn_clear.config(state='disabled')
-        run_countdown(10)
-
-    def trigger_clear():
+    def trigger_bg_clear():
         shared_bounds['bg_state'] = 'clear'
-        status_label.config(text="Status: Inactive", fg="gray")
-        btn_clear.config(state='disabled')
 
-    btn_calibrate = tk.Button(bg_frame, text="Calibrate Background (10s)", command=trigger_calibration, bg="#e1f5fe")
-    btn_calibrate.pack(side="left", expand=True, fill="x", padx=(0, 5))
+    btn_bg_calib = tk.Button(bg_frame, text="Calibrate (10s)", command=trigger_bg_calib, bg="#e1f5fe")
+    btn_bg_calib.pack(side="left", expand=True, fill="x", padx=(0, 5))
+    tk.Button(bg_frame, text="Clear File", command=trigger_bg_clear, bg="#ffebee").pack(side="right", fill="x")
 
-    btn_clear = tk.Button(bg_frame, text="Clear", command=trigger_clear, state='disabled', bg="#ffebee")
-    btn_clear.pack(side="right", expand=True, fill="x", padx=(5, 0))
+    # ── Chair Signature Section ──
+    chair_frame = tk.LabelFrame(root, text=" 2. Human Extraction (Chair Filter) ", font=('Arial', 10, 'bold'), padx=10,
+                                pady=5)
+    chair_frame.pack(fill="x", pady=5)
+
+    chair_status = tk.Label(chair_frame, text="Status: Inactive", font=('Arial', 9), fg="gray")
+    chair_status.pack(pady=(0, 5))
+
+    def trigger_chair_enable():
+        shared_bounds['chair_state'] = 'active'
+        chair_status.config(text="Active (Extracting Human)", fg="green")
+
+    def trigger_chair_disable():
+        shared_bounds['chair_state'] = 'idle'
+        chair_status.config(text="Inactive", fg="gray")
+
+    btn_chair_en = tk.Button(chair_frame, text="Enable Filter", command=trigger_chair_enable, bg="#e8f5e9")
+    btn_chair_en.pack(side="left", expand=True, fill="x", padx=(0, 5))
+    tk.Button(chair_frame, text="Disable", command=trigger_chair_disable, bg="#ffebee").pack(side="right", fill="x")
 
     def update_shared_dict():
         nonlocal last_saved_values
@@ -127,21 +226,23 @@ def roi_control_panel(shared_bounds):
                 if os.path.exists(CONFIG_FILE):
                     with open(CONFIG_FILE, "r") as f:
                         file_data = json.load(f)
-
                 file_data.update(current_vals)
                 with open(CONFIG_FILE, "w") as f:
                     json.dump(file_data, f, indent=4)
                 last_saved_values = current_vals
-            except Exception as e:
-                print(f"Error auto-saving settings: {e}")
+            except Exception:
+                pass
 
-        # Sync visual status if changed externally by Open3D backend
-        current_state = shared_bounds['bg_state']
-        if current_state == 'active' and "Active" not in status_label.cget("text"):
-            status_label.config(text="Status: Subtraction Active", fg="green")
-            btn_clear.config(state='normal')
+        # Sync visual statuses
+        b_st = shared_bounds.get('bg_state', 'idle')
+        if b_st == 'active':
+            bg_status.config(text="Active (Room Hidden)", fg="green")
+        elif b_st == 'idle':
+            bg_status.config(text="Inactive", fg="gray")
+        elif b_st == 'scanning':
+            bg_status.config(text="Scanning empty room...", fg="blue")
 
-        root.after(50, update_shared_dict)
+        root.after(100, update_shared_dict)
 
     update_shared_dict()
     root.mainloop()
@@ -150,7 +251,6 @@ def roi_control_panel(shared_bounds):
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Protocol & Parsing
 # ═══════════════════════════════════════════════════════════════════════════════
-
 def livox_crc16(data: bytes) -> int:
     crc = 0x4C49
     for b in data:
@@ -182,8 +282,7 @@ def build_cmd(cmd_set: int, cmd_id: int, payload: bytes = b'', cmd_type: int = 0
     pre_crc = struct.pack('<BBHBH', 0xAA, 0x01, total_len, cmd_type, _next_seq())
     header = pre_crc + struct.pack('<H', livox_crc16(pre_crc))
     packet_without_crc32 = header + data
-    crc32_val = livox_crc32(packet_without_crc32)
-    return packet_without_crc32 + struct.pack('<I', crc32_val)
+    return packet_without_crc32 + struct.pack('<I', livox_crc32(packet_without_crc32))
 
 
 def cmd_handshake(host_ip: str, data_port: int, cmd_port: int, imu_port: int) -> bytes:
@@ -191,37 +290,31 @@ def cmd_handshake(host_ip: str, data_port: int, cmd_port: int, imu_port: int) ->
     return build_cmd(0x00, 0x01, payload, cmd_type=0x01)
 
 
-def cmd_heartbeat() -> bytes:
-    return build_cmd(0x00, 0x03)
+def cmd_heartbeat() -> bytes: return build_cmd(0x00, 0x03)
 
 
-def cmd_start_sampling(start: bool = True) -> bytes:
-    return build_cmd(0x00, 0x04, bytes([0x01 if start else 0x00]))
+def cmd_start_sampling(start: bool = True) -> bytes: return build_cmd(0x00, 0x04, bytes([0x01 if start else 0x00]))
 
 
-def cmd_set_cartesian() -> bytes:
-    return build_cmd(0x00, 0x05, bytes([0x00]))
+def cmd_set_cartesian() -> bytes: return build_cmd(0x00, 0x05, bytes([0x00]))
 
 
 _DATA_HDR = 18
 
 
 def parse_data_packet(data: bytes) -> list:
-    if len(data) < _DATA_HDR + 1 or data[0] == 0xAA:
-        return []
+    if len(data) < _DATA_HDR + 1 or data[0] == 0xAA: return []
     dtype = data[9]
     offset = _DATA_HDR
     pts = []
     if dtype == 0:
-        n = (len(data) - _DATA_HDR) // 13
-        for _ in range(n):
+        for _ in range((len(data) - _DATA_HDR) // 13):
             if offset + 13 > len(data): break
             x, y, z, _ = struct.unpack_from('<iiiB', data, offset)
             pts.append([x * 1e-3, y * 1e-3, z * 1e-3])
             offset += 13
     elif dtype == 1:
-        n = (len(data) - _DATA_HDR) // 9
-        for _ in range(n):
+        for _ in range((len(data) - _DATA_HDR) // 9):
             if offset + 9 > len(data): break
             depth, theta, phi, _ = struct.unpack_from('<IHHB', data, offset)
             r = depth * 1e-3
@@ -230,8 +323,7 @@ def parse_data_packet(data: bytes) -> list:
             pts.append([r * np.sin(ze) * np.cos(az), r * np.sin(ze) * np.sin(az), r * np.cos(ze)])
             offset += 9
     elif dtype == 2:
-        n = (len(data) - _DATA_HDR) // 14
-        for _ in range(n):
+        for _ in range((len(data) - _DATA_HDR) // 14):
             if offset + 14 > len(data): break
             x, y, z, _, _ = struct.unpack_from('<iiiBB', data, offset)
             pts.append([x * 1e-3, y * 1e-3, z * 1e-3])
@@ -245,11 +337,10 @@ def send_and_ack(sock, pkt: bytes, dest: tuple, label: str, timeout: float = 2.0
     try:
         ack, _ = sock.recvfrom(512)
         ret = ack[11] if len(ack) > 11 else 0xFF
-        status = "OK" if ret == 0 else f"ret_code={ret}"
-        print(f"  {label:25s}  {status}")
+        print(f"  {label:25s}  {'OK' if ret == 0 else f'ret_code={ret}'}")
         return ret
     except socket.timeout:
-        print(f"  {label:25s}  no ACK (timeout) – verify connection")
+        print(f"  {label:25s}  no ACK (timeout)")
         return None
 
 
@@ -261,11 +352,10 @@ def get_box_lineset(min_b, max_b):
         [min_b[0], max_b[1], max_b[2]], [max_b[0], max_b[1], max_b[2]],
     ]
     lines = [[0, 1], [0, 2], [1, 3], [2, 3], [4, 5], [4, 6], [5, 7], [6, 7], [0, 4], [1, 5], [2, 6], [3, 7]]
-    colors = [[1, 0.2, 0.2] for _ in range(12)]
     ls = o3d.geometry.LineSet()
     ls.points = o3d.utility.Vector3dVector(points)
     ls.lines = o3d.utility.Vector2iVector(lines)
-    ls.colors = o3d.utility.Vector3dVector(colors)
+    ls.colors = o3d.utility.Vector3dVector([[1, 0.2, 0.2] for _ in range(12)])
     return ls
 
 
@@ -274,12 +364,8 @@ def get_box_lineset(min_b, max_b):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def live_livox_viewer(shared_bounds, initial_camera=None):
-    sep = "─" * 62
-    print(sep)
-    print("  Livox Avia – Direct SDK Viewer (Live ROI & Background Sync)")
-    print(sep + "\n")
+    print("  Livox Avia – SDK Viewer (Human Extraction Filter)\n")
 
-    print(f"[1/4] Waiting for device broadcast on port {BROADCAST_PORT}...")
     bcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     bcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     bcast_sock.bind(("0.0.0.0", BROADCAST_PORT))
@@ -291,11 +377,9 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
             try:
                 raw, addr = bcast_sock.recvfrom(256)
             except socket.timeout:
-                print("  TIMEOUT – no broadcast received. Check cables.")
                 return
             if (len(raw) >= 34 and raw[0] == 0xAA and raw[9] == 0x00 and raw[10] == 0x00):
                 device_ip = addr[0]
-                print(f"  Device found   : {device_ip}")
     finally:
         bcast_sock.close()
 
@@ -304,17 +388,12 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
         s.connect((device_ip, 1))
         host_ip = s.getsockname()[0]
 
-    print(f"\n[2/4] Handshake  (this host = {host_ip})")
     cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     cmd_sock.bind((host_ip, HOST_CMD_PORT))
-
-    hs_pkt = cmd_handshake(host_ip, HOST_DATA_PORT, HOST_CMD_PORT, HOST_IMU_PORT)
-    send_and_ack(cmd_sock, hs_pkt, dest, "Handshake")
+    send_and_ack(cmd_sock, cmd_handshake(host_ip, HOST_DATA_PORT, HOST_CMD_PORT, HOST_IMU_PORT), dest, "Handshake")
     time.sleep(0.05)
     send_and_ack(cmd_sock, cmd_set_cartesian(), dest, "Set Cartesian coords")
     time.sleep(0.05)
-
-    print(f"\n[3/4] Starting data stream...")
     send_and_ack(cmd_sock, cmd_start_sampling(True), dest, "Start sampling")
 
     stop_event = threading.Event()
@@ -333,17 +412,13 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
                 pass
             time.sleep(HEARTBEAT_INTERVAL_S)
 
-    hb_thread = threading.Thread(target=_heartbeat, daemon=True)
-    hb_thread.start()
+    threading.Thread(target=_heartbeat, daemon=True).start()
 
     data_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     data_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     data_sock.bind((host_ip, HOST_DATA_PORT))
     data_sock.setblocking(False)
 
-    print(f"\n[4/4] Rendering Live Stream...")
-
-    # ── Open3D window ──
     vis = o3d.visualization.Visualizer()
     vis.create_window("Livox Avia – Direct", 1280, 720)
 
@@ -352,15 +427,13 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
     vis.add_geometry(pcd)
     vis.add_geometry(o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0))
 
-    init_min = [min(shared_bounds['X1'], shared_bounds['X2']), min(shared_bounds['Y1'], shared_bounds['Y2']),
-                min(shared_bounds['Z1'], shared_bounds['Z2'])]
-    init_max = [max(shared_bounds['X1'], shared_bounds['X2']), max(shared_bounds['Y1'], shared_bounds['Y2']),
-                max(shared_bounds['Z1'], shared_bounds['Z2'])]
+    init_min = [shared_bounds['X1'], shared_bounds['Y1'], shared_bounds['Z1']]
+    init_max = [shared_bounds['X2'], shared_bounds['Y2'], shared_bounds['Z2']]
     roi_box_vis = get_box_lineset(init_min, init_max)
     vis.add_geometry(roi_box_vis)
 
     ro = vis.get_render_option()
-    ro.point_size = 1.5
+    ro.point_size = 2.0
     ro.background_color = np.array([0.05, 0.05, 0.05])
 
     if initial_camera is not None:
@@ -370,15 +443,26 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
             cam = o3d.io.read_pinhole_camera_parameters("temp_cam_load.json")
             vis.get_view_control().convert_from_pinhole_camera_parameters(cam, allow_arbitrary=True)
             os.remove("temp_cam_load.json")
-        except Exception as e:
-            print(f"  -> Could not load camera view: {e}")
+        except:
+            pass
 
-    # ── Background Cancellation State variables ──
+    # ── PERSISTENT BACKGROUND LOADING ──
     background_pcd = None
+    if os.path.exists(BG_PCD_FILE):
+        try:
+            background_pcd = o3d.io.read_point_cloud(BG_PCD_FILE)
+            if not background_pcd.is_empty():
+                shared_bounds['bg_state'] = 'active'
+                print(f"  [Init] Loaded existing background file: {BG_PCD_FILE}")
+            else:
+                background_pcd = None
+        except Exception as e:
+            print(f"  [Init] Failed to load saved background file: {e}")
+            background_pcd = None
+
     bg_accumulating = False
     bg_accumulated_pts = []
     bg_start_time = 0.0
-    SUBTRACTION_RADIUS_M = 0.06  # 6 centimeters distance tolerance filter
 
     accumulated_pts = []
     last_render_time = time.time()
@@ -399,15 +483,13 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
                 max_b = [max(shared_bounds['X1'], shared_bounds['X2']), max(shared_bounds['Y1'], shared_bounds['Y2']),
                          max(shared_bounds['Z1'], shared_bounds['Z2'])]
 
-                new_box = get_box_lineset(min_b, max_b)
-                roi_box_vis.points = new_box.points
+                roi_box_vis.points = get_box_lineset(min_b, max_b).points
                 vis.update_geometry(roi_box_vis)
 
                 if accumulated_pts:
                     arr = np.asarray(accumulated_pts, dtype=np.float64)
                     dists = np.linalg.norm(arr, axis=1)
 
-                    # Apply Spatial ROI Bounds
                     roi_mask = (
                             (dists > 0.01) &
                             (arr[:, 0] >= min_b[0]) & (arr[:, 0] <= max_b[0]) &
@@ -417,54 +499,65 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
                     arr = arr[roi_mask]
                     dists = dists[roi_mask]
 
-                    # ── Handle Background Subtraction Logic ──
+                    # ── 1. BACKGROUND CANCELLATION ──
                     bg_state = shared_bounds.get('bg_state', 'idle')
-
                     if bg_state == 'clear':
                         background_pcd = None
                         bg_accumulating = False
+                        if os.path.exists(BG_PCD_FILE):
+                            try:
+                                os.remove(BG_PCD_FILE)
+                                print("  [Background] Calibration file deleted from disk.")
+                            except Exception:
+                                pass
                         shared_bounds['bg_state'] = 'idle'
-                        print("-> Background filter cleared.")
-
                     elif bg_state == 'capture':
-                        # Setup collection sweep window
                         bg_accumulating = True
                         bg_accumulated_pts = []
                         bg_start_time = time.time()
                         shared_bounds['bg_state'] = 'scanning'
-                        print("-> Beginning 2.5s environment collection...")
 
                     if bg_accumulating:
-                        if len(arr) > 0:
-                            bg_accumulated_pts.extend(arr.tolist())
-                        # Collect fields for 2.5s to dense map the non-repetitive flower patterns
-                        if time.time() - bg_start_time >= 2.5:
+                        bg_accumulated_pts.extend(arr.tolist())
+                        if time.time() - bg_start_time >= 2.0:
                             bg_accumulating = False
                             if len(bg_accumulated_pts) > 0:
                                 background_pcd = o3d.geometry.PointCloud()
                                 background_pcd.points = o3d.utility.Vector3dVector(np.array(bg_accumulated_pts))
-                                # Downsample slightly to unify the lookup map
                                 background_pcd = background_pcd.voxel_down_sample(voxel_size=0.03)
+
+                                # ── PERSISTENT BACKGROUND SAVING ──
+                                try:
+                                    o3d.io.write_point_cloud(BG_PCD_FILE, background_pcd)
+                                    print(f"  [Background] Calibration successfully saved to {BG_PCD_FILE}")
+                                except Exception as e:
+                                    print(f"  [Background] Failed to save file: {e}")
+
                                 shared_bounds['bg_state'] = 'active'
-                                print(f"-> Calibration successful! Point map count: {len(background_pcd.points)}")
                             else:
                                 shared_bounds['bg_state'] = 'idle'
-                                print("-> Calibration failed (No visual data detected inside ROI).")
 
-                    # Apply background suppression matrix if operational
-                    if bg_state == 'active' and background_pcd is not None and len(arr) > 0:
+                    if (shared_bounds.get(
+                            'bg_state') == 'active' or bg_state == 'active') and background_pcd is not None and len(
+                            arr) > 0:
                         tmp_cloud = o3d.geometry.PointCloud()
                         tmp_cloud.points = o3d.utility.Vector3dVector(arr)
+                        dists_to_bg = np.asarray(tmp_cloud.compute_point_cloud_distance(background_pcd))
+                        mask = dists_to_bg > 0.06
+                        arr = arr[mask]
+                        dists = dists[mask]
 
-                        # High performance distance compute using native C++ map backend
-                        points_to_bg_distances = np.asarray(tmp_cloud.compute_point_cloud_distance(background_pcd))
+                    # ── 2. LIVE HUMAN EXTRACTION (CHAIR FILTER) ──
+                    chair_state = shared_bounds.get('chair_state', 'idle')
 
-                        # Only keep points further than the tolerance radius
-                        subtraction_mask = points_to_bg_distances > SUBTRACTION_RADIUS_M
-                        arr = arr[subtraction_mask]
-                        dists = dists[subtraction_mask]
+                    if chair_state == 'active' and len(arr) > 20:
+                        # Assuming h_head=1.0 meters above origin for detecting the head
+                        human_mask = get_human_indices(arr, eps=0.15, min_points=10, ransac_iters=50)
+                        if human_mask is not None:
+                            arr = arr[human_mask]
+                            dists = dists[human_mask]
 
-                    # Render Final output frame
+                    # ── Render Final Frame ──
                     if len(arr) > 0:
                         pcd.points = o3d.utility.Vector3dVector(arr)
                         norm_dists = np.clip(dists / MAX_COLOR_DIST_M, 0.0, 1.0)
@@ -487,30 +580,23 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
             time.sleep(0.001)
 
     except KeyboardInterrupt:
-        print("\nStopping...")
+        pass
     finally:
         stop_event.set()
-
-        # Save camera orientation states
         try:
             cam_params = vis.get_view_control().convert_to_pinhole_camera_parameters()
             o3d.io.write_pinhole_camera_parameters("temp_cam_save.json", cam_params)
             with open("temp_cam_save.json", "r") as f:
                 cam_data = json.load(f)
             os.remove("temp_cam_save.json")
-
             file_data = {}
             if os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, "r") as f:
-                    file_data = json.load(f)
-
+                with open(CONFIG_FILE, "r") as f: file_data = json.load(f)
             file_data["camera_view"] = cam_data
             with open(CONFIG_FILE, "w") as f:
                 json.dump(file_data, f, indent=4)
-            print("-> Camera viewpoint saved successfully.")
-        except Exception as e:
-            print(f"-> Notice: Could not save camera parameters ({e})")
-
+        except Exception:
+            pass
         try:
             cmd_sock.setblocking(True)
             cmd_sock.sendto(cmd_start_sampling(False), dest)
@@ -521,13 +607,8 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
         vis.destroy_window()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Multiprocessing Entry Point
-# ═══════════════════════════════════════════════════════════════════════════════
-
 if __name__ == "__main__":
     multiprocessing.freeze_support()
-
     initial_bounds = {'X1': -5.0, 'X2': 5.0, 'Y1': -5.0, 'Y2': 5.0, 'Z1': -2.0, 'Z2': 5.0}
     initial_camera = None
 
@@ -535,26 +616,19 @@ if __name__ == "__main__":
         try:
             with open(CONFIG_FILE, "r") as f:
                 file_data = json.load(f)
-
             for k in initial_bounds.keys():
-                if k in file_data:
-                    initial_bounds[k] = file_data[k]
-
-            if "camera_view" in file_data:
-                initial_camera = file_data["camera_view"]
-            print(f"-> Loaded existing config from {CONFIG_FILE}")
+                if k in file_data: initial_bounds[k] = file_data[k]
+            if "camera_view" in file_data: initial_camera = file_data["camera_view"]
         except Exception:
-            print("-> Found corrupted config file. Loading defaults.")
+            pass
 
-    # Append processing variables for background state sync
     initial_bounds['bg_state'] = 'idle'
+    initial_bounds['chair_state'] = 'idle'
 
     with multiprocessing.Manager() as manager:
         shared_bounds = manager.dict(initial_bounds)
-
         gui_process = multiprocessing.Process(target=roi_control_panel, args=(shared_bounds,))
         gui_process.start()
-
         try:
             live_livox_viewer(shared_bounds, initial_camera)
         finally:
