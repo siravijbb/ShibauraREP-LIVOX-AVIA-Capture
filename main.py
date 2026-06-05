@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Livox Avia – Direct SDK Viewer (With Persistent Live ROI Controls)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Livox Avia – Direct SDK Viewer (With Persistent Live ROI & Camera Controls)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 import socket
@@ -44,7 +44,7 @@ def roi_control_panel(shared_bounds):
     root = tk.Tk()
     root.title("ROI Control Panel")
     root.geometry("320x450")
-    root.attributes('-topmost', True)  # Keeps the window floating above Open3D
+    root.attributes('-topmost', True)
     root.configure(padx=15, pady=15)
 
     tk.Label(root, text="Adjust ROI Bounding Box", font=('Arial', 12, 'bold')).pack(pady=(0, 10))
@@ -57,8 +57,6 @@ def roi_control_panel(shared_bounds):
         return s
 
     sliders = {k: make_slider(k, v) for k, v in shared_bounds.items()}
-
-    # Initialize tracking dictionary to avoid heavy redundant disk writes
     last_saved_values = {k: s.get() for k, s in sliders.items()}
 
     def update_shared_dict():
@@ -66,7 +64,6 @@ def roi_control_panel(shared_bounds):
         current_vals = {}
         has_changed = False
 
-        # Pull values from UI sliders to shared memory
         for k, s in sliders.items():
             val = s.get()
             current_vals[k] = val
@@ -74,11 +71,19 @@ def roi_control_panel(shared_bounds):
             if val != last_saved_values.get(k):
                 has_changed = True
 
-        # Save to file immediately if any slider was moved
         if has_changed:
             try:
+                # Load existing config to PRESERVE camera data
+                file_data = {}
+                if os.path.exists(CONFIG_FILE):
+                    with open(CONFIG_FILE, "r") as f:
+                        file_data = json.load(f)
+
+                # Update only the bounding box values
+                file_data.update(current_vals)
+
                 with open(CONFIG_FILE, "w") as f:
-                    json.dump(current_vals, f, indent=4)
+                    json.dump(file_data, f, indent=4)
                 last_saved_values = current_vals
             except Exception as e:
                 print(f"Error auto-saving settings: {e}")
@@ -198,7 +203,6 @@ def send_and_ack(sock, pkt: bytes, dest: tuple, label: str, timeout: float = 2.0
 
 
 def get_box_lineset(min_b, max_b):
-    """Creates a wireframe Open3D geometry representing the bounding box."""
     points = [
         [min_b[0], min_b[1], min_b[2]], [max_b[0], min_b[1], min_b[2]],
         [min_b[0], max_b[1], min_b[2]], [max_b[0], max_b[1], min_b[2]],
@@ -207,7 +211,6 @@ def get_box_lineset(min_b, max_b):
     ]
     lines = [[0, 1], [0, 2], [1, 3], [2, 3], [4, 5], [4, 6], [5, 7], [6, 7], [0, 4], [1, 5], [2, 6], [3, 7]]
     colors = [[1, 0.2, 0.2] for _ in range(12)]
-
     ls = o3d.geometry.LineSet()
     ls.points = o3d.utility.Vector3dVector(points)
     ls.lines = o3d.utility.Vector2iVector(lines)
@@ -219,10 +222,10 @@ def get_box_lineset(min_b, max_b):
 #  Main Loop
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def live_livox_viewer(shared_bounds):
+def live_livox_viewer(shared_bounds, initial_camera=None):
     sep = "─" * 62
     print(sep)
-    print("  Livox Avia – Direct SDK Viewer (Live ROI Controls)")
+    print("  Livox Avia – Direct SDK Viewer (Live ROI & Camera Sync)")
     print(sep + "\n")
 
     print(f"[1/4] Waiting for device broadcast on port {BROADCAST_PORT}...")
@@ -290,7 +293,7 @@ def live_livox_viewer(shared_bounds):
 
     print(f"\n[4/4] Rendering Live Stream...")
     print("      Use the popup panel to adjust the ROI bounding box.")
-    print("      Settings are saved automatically on change!")
+    print("      Camera & ROI settings auto-save to 1 file on exit.")
     print("      Press Ctrl+C in the terminal to stop.\n")
 
     # ── Open3D window ──
@@ -302,7 +305,6 @@ def live_livox_viewer(shared_bounds):
     vis.add_geometry(pcd)
     vis.add_geometry(o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0))
 
-    # Grab snapshot bounding box to generate initial LineSet
     init_min = [min(shared_bounds['X1'], shared_bounds['X2']), min(shared_bounds['Y1'], shared_bounds['Y2']),
                 min(shared_bounds['Z1'], shared_bounds['Z2'])]
     init_max = [max(shared_bounds['X1'], shared_bounds['X2']), max(shared_bounds['Y1'], shared_bounds['Y2']),
@@ -313,6 +315,17 @@ def live_livox_viewer(shared_bounds):
     ro = vis.get_render_option()
     ro.point_size = 1.5
     ro.background_color = np.array([0.05, 0.05, 0.05])
+
+    # APPLY SAVED CAMERA VIEW
+    if initial_camera is not None:
+        try:
+            with open("temp_cam_load.json", "w") as f:
+                json.dump(initial_camera, f)
+            cam = o3d.io.read_pinhole_camera_parameters("temp_cam_load.json")
+            vis.get_view_control().convert_from_pinhole_camera_parameters(cam, allow_arbitrary=True)
+            os.remove("temp_cam_load.json")
+        except Exception as e:
+            print(f"  -> Could not load camera view: {e}")
 
     accumulated_pts = []
     last_render_time = time.time()
@@ -376,6 +389,28 @@ def live_livox_viewer(shared_bounds):
         print("\nStopping...")
     finally:
         stop_event.set()
+
+        # ── MERGE CAMERA PARAMETERS ON EXIT ──
+        try:
+            cam_params = vis.get_view_control().convert_to_pinhole_camera_parameters()
+            o3d.io.write_pinhole_camera_parameters("temp_cam_save.json", cam_params)
+            with open("temp_cam_save.json", "r") as f:
+                cam_data = json.load(f)
+            os.remove("temp_cam_save.json")
+
+            file_data = {}
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE, "r") as f:
+                    file_data = json.load(f)
+
+            file_data["camera_view"] = cam_data
+
+            with open(CONFIG_FILE, "w") as f:
+                json.dump(file_data, f, indent=4)
+            print("-> Final camera viewpoint saved successfully.")
+        except Exception as e:
+            print(f"-> Notice: Could not save camera parameters ({e})")
+
         try:
             cmd_sock.setblocking(True)
             cmd_sock.sendto(cmd_start_sampling(False), dest)
@@ -393,28 +428,35 @@ def live_livox_viewer(shared_bounds):
 if __name__ == "__main__":
     multiprocessing.freeze_support()
 
-    # Check if a configuration file already exists from a previous run
+    initial_bounds = {'X1': -5.0, 'X2': 5.0, 'Y1': -5.0, 'Y2': 5.0, 'Z1': -2.0, 'Z2': 5.0}
+    initial_camera = None
+
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
-                initial_bounds = json.load(f)
-            print(f"-> Loaded existing ROI config from {CONFIG_FILE}")
+                file_data = json.load(f)
+
+            # Load bounds if they exist
+            for k in initial_bounds.keys():
+                if k in file_data:
+                    initial_bounds[k] = file_data[k]
+
+            # Load camera if it exists
+            if "camera_view" in file_data:
+                initial_camera = file_data["camera_view"]
+
+            print(f"-> Loaded existing config (ROI + Camera) from {CONFIG_FILE}")
         except Exception:
             print("-> Found corrupted config file. Loading defaults.")
-            initial_bounds = {'X1': -5.0, 'X2': 5.0, 'Y1': -5.0, 'Y2': 5.0, 'Z1': -2.0, 'Z2': 5.0}
-    else:
-        # Defaults if no config file exists yet
-        initial_bounds = {'X1': -5.0, 'X2': 5.0, 'Y1': -5.0, 'Y2': 5.0, 'Z1': -2.0, 'Z2': 5.0}
 
     with multiprocessing.Manager() as manager:
         shared_bounds = manager.dict(initial_bounds)
 
-        # Start slider interface
         gui_process = multiprocessing.Process(target=roi_control_panel, args=(shared_bounds,))
         gui_process.start()
 
         try:
-            live_livox_viewer(shared_bounds)
+            live_livox_viewer(shared_bounds, initial_camera)
         finally:
             gui_process.terminate()
             gui_process.join()
