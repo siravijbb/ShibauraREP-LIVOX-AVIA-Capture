@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Livox Avia – Direct SDK Viewer (With Persistent Live ROI & Camera Controls)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Livox Avia – Direct SDK Viewer (With Live ROI & Background Cancellation)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 import socket
@@ -36,28 +36,78 @@ CONFIG_FILE = "roi_settings.json"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  GUI Control Panel Process (With Auto-Save)
+#  GUI Control Panel Process
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def roi_control_panel(shared_bounds):
     """Runs a Tkinter window in a separate process to avoid blocking Open3D."""
     root = tk.Tk()
-    root.title("ROI Control Panel")
-    root.geometry("320x450")
+    root.title("ROI & Background Panel")
+    root.geometry("340x560")
     root.attributes('-topmost', True)
     root.configure(padx=15, pady=15)
 
-    tk.Label(root, text="Adjust ROI Bounding Box", font=('Arial', 12, 'bold')).pack(pady=(0, 10))
+    tk.Label(root, text="Adjust ROI Bounding Box", font=('Arial', 12, 'bold')).pack(pady=(0, 5))
 
     def make_slider(name, val):
-        tk.Label(root, text=f"{name} Axis", font=('Arial', 9, 'bold'), fg="gray").pack(anchor='w', pady=(5, 0))
-        s = tk.Scale(root, from_=-20.0, to=20.0, resolution=0.1, orient='horizontal', length=280)
+        tk.Label(root, text=f"{name} Axis", font=('Arial', 9, 'bold'), fg="gray").pack(anchor='w', pady=(3, 0))
+        s = tk.Scale(root, from_=-20.0, to=20.0, resolution=0.1, orient='horizontal', length=300)
         s.set(val)
         s.pack()
         return s
 
-    sliders = {k: make_slider(k, v) for k, v in shared_bounds.items()}
+    # Ensure we only generate sliders for spatial keys
+    spatial_keys = ['X1', 'X2', 'Y1', 'Y2', 'Z1', 'Z2']
+    sliders = {k: make_slider(k, shared_bounds[k]) for k in spatial_keys}
     last_saved_values = {k: s.get() for k, s in sliders.items()}
+
+    # ── Background Subtraction UI Section ──
+    tk.Frame(root, height=2, bd=1, relief="sunken").pack(fill="x", pady=15)
+
+    bg_frame = tk.LabelFrame(root, text=" Background Cancellation ", font=('Arial', 10, 'bold'), padx=10, pady=10)
+    bg_frame.pack(fill="x")
+
+    # FIXED: Changed 'medium' to 'normal'
+    status_label = tk.Label(bg_frame, text="Status: Inactive", font=('Arial', 10, 'normal'), fg="gray")
+    status_label.pack(pady=(0, 8))
+
+    def run_countdown(count):
+        if count > 0:
+            shared_bounds['bg_state'] = 'countdown'
+            status_label.config(text=f"Calibrating in {count}s...", fg="orange")
+            root.after(1000, run_countdown, count - 1)
+        else:
+            status_label.config(text="Scanning environment (Keep clear)...", fg="blue")
+            shared_bounds['bg_state'] = 'capture'
+            monitor_capture()
+
+    def monitor_capture():
+        state = shared_bounds['bg_state']
+        if state == 'active':
+            status_label.config(text="Status: Subtraction Active", fg="green")
+            btn_calibrate.config(state='normal')
+            btn_clear.config(state='normal')
+        elif state == 'idle':
+            status_label.config(text="Status: Inactive", fg="gray")
+            btn_calibrate.config(state='normal')
+        else:
+            root.after(200, monitor_capture)
+
+    def trigger_calibration():
+        btn_calibrate.config(state='disabled')
+        btn_clear.config(state='disabled')
+        run_countdown(10)
+
+    def trigger_clear():
+        shared_bounds['bg_state'] = 'clear'
+        status_label.config(text="Status: Inactive", fg="gray")
+        btn_clear.config(state='disabled')
+
+    btn_calibrate = tk.Button(bg_frame, text="Calibrate Background (10s)", command=trigger_calibration, bg="#e1f5fe")
+    btn_calibrate.pack(side="left", expand=True, fill="x", padx=(0, 5))
+
+    btn_clear = tk.Button(bg_frame, text="Clear", command=trigger_clear, state='disabled', bg="#ffebee")
+    btn_clear.pack(side="right", expand=True, fill="x", padx=(5, 0))
 
     def update_shared_dict():
         nonlocal last_saved_values
@@ -73,20 +123,23 @@ def roi_control_panel(shared_bounds):
 
         if has_changed:
             try:
-                # Load existing config to PRESERVE camera data
                 file_data = {}
                 if os.path.exists(CONFIG_FILE):
                     with open(CONFIG_FILE, "r") as f:
                         file_data = json.load(f)
 
-                # Update only the bounding box values
                 file_data.update(current_vals)
-
                 with open(CONFIG_FILE, "w") as f:
                     json.dump(file_data, f, indent=4)
                 last_saved_values = current_vals
             except Exception as e:
                 print(f"Error auto-saving settings: {e}")
+
+        # Sync visual status if changed externally by Open3D backend
+        current_state = shared_bounds['bg_state']
+        if current_state == 'active' and "Active" not in status_label.cget("text"):
+            status_label.config(text="Status: Subtraction Active", fg="green")
+            btn_clear.config(state='normal')
 
         root.after(50, update_shared_dict)
 
@@ -156,11 +209,9 @@ _DATA_HDR = 18
 def parse_data_packet(data: bytes) -> list:
     if len(data) < _DATA_HDR + 1 or data[0] == 0xAA:
         return []
-
     dtype = data[9]
     offset = _DATA_HDR
     pts = []
-
     if dtype == 0:
         n = (len(data) - _DATA_HDR) // 13
         for _ in range(n):
@@ -225,7 +276,7 @@ def get_box_lineset(min_b, max_b):
 def live_livox_viewer(shared_bounds, initial_camera=None):
     sep = "─" * 62
     print(sep)
-    print("  Livox Avia – Direct SDK Viewer (Live ROI & Camera Sync)")
+    print("  Livox Avia – Direct SDK Viewer (Live ROI & Background Sync)")
     print(sep + "\n")
 
     print(f"[1/4] Waiting for device broadcast on port {BROADCAST_PORT}...")
@@ -242,7 +293,6 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
             except socket.timeout:
                 print("  TIMEOUT – no broadcast received. Check cables.")
                 return
-
             if (len(raw) >= 34 and raw[0] == 0xAA and raw[9] == 0x00 and raw[10] == 0x00):
                 device_ip = addr[0]
                 print(f"  Device found   : {device_ip}")
@@ -292,9 +342,6 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
     data_sock.setblocking(False)
 
     print(f"\n[4/4] Rendering Live Stream...")
-    print("      Use the popup panel to adjust the ROI bounding box.")
-    print("      Camera & ROI settings auto-save to 1 file on exit.")
-    print("      Press Ctrl+C in the terminal to stop.\n")
 
     # ── Open3D window ──
     vis = o3d.visualization.Visualizer()
@@ -316,7 +363,6 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
     ro.point_size = 1.5
     ro.background_color = np.array([0.05, 0.05, 0.05])
 
-    # APPLY SAVED CAMERA VIEW
     if initial_camera is not None:
         try:
             with open("temp_cam_load.json", "w") as f:
@@ -326,6 +372,13 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
             os.remove("temp_cam_load.json")
         except Exception as e:
             print(f"  -> Could not load camera view: {e}")
+
+    # ── Background Cancellation State variables ──
+    background_pcd = None
+    bg_accumulating = False
+    bg_accumulated_pts = []
+    bg_start_time = 0.0
+    SUBTRACTION_RADIUS_M = 0.06  # 6 centimeters distance tolerance filter
 
     accumulated_pts = []
     last_render_time = time.time()
@@ -354,16 +407,64 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
                     arr = np.asarray(accumulated_pts, dtype=np.float64)
                     dists = np.linalg.norm(arr, axis=1)
 
+                    # Apply Spatial ROI Bounds
                     roi_mask = (
                             (dists > 0.01) &
                             (arr[:, 0] >= min_b[0]) & (arr[:, 0] <= max_b[0]) &
                             (arr[:, 1] >= min_b[1]) & (arr[:, 1] <= max_b[1]) &
                             (arr[:, 2] >= min_b[2]) & (arr[:, 2] <= max_b[2])
                     )
-
                     arr = arr[roi_mask]
                     dists = dists[roi_mask]
 
+                    # ── Handle Background Subtraction Logic ──
+                    bg_state = shared_bounds.get('bg_state', 'idle')
+
+                    if bg_state == 'clear':
+                        background_pcd = None
+                        bg_accumulating = False
+                        shared_bounds['bg_state'] = 'idle'
+                        print("-> Background filter cleared.")
+
+                    elif bg_state == 'capture':
+                        # Setup collection sweep window
+                        bg_accumulating = True
+                        bg_accumulated_pts = []
+                        bg_start_time = time.time()
+                        shared_bounds['bg_state'] = 'scanning'
+                        print("-> Beginning 2.5s environment collection...")
+
+                    if bg_accumulating:
+                        if len(arr) > 0:
+                            bg_accumulated_pts.extend(arr.tolist())
+                        # Collect fields for 2.5s to dense map the non-repetitive flower patterns
+                        if time.time() - bg_start_time >= 2.5:
+                            bg_accumulating = False
+                            if len(bg_accumulated_pts) > 0:
+                                background_pcd = o3d.geometry.PointCloud()
+                                background_pcd.points = o3d.utility.Vector3dVector(np.array(bg_accumulated_pts))
+                                # Downsample slightly to unify the lookup map
+                                background_pcd = background_pcd.voxel_down_sample(voxel_size=0.03)
+                                shared_bounds['bg_state'] = 'active'
+                                print(f"-> Calibration successful! Point map count: {len(background_pcd.points)}")
+                            else:
+                                shared_bounds['bg_state'] = 'idle'
+                                print("-> Calibration failed (No visual data detected inside ROI).")
+
+                    # Apply background suppression matrix if operational
+                    if bg_state == 'active' and background_pcd is not None and len(arr) > 0:
+                        tmp_cloud = o3d.geometry.PointCloud()
+                        tmp_cloud.points = o3d.utility.Vector3dVector(arr)
+
+                        # High performance distance compute using native C++ map backend
+                        points_to_bg_distances = np.asarray(tmp_cloud.compute_point_cloud_distance(background_pcd))
+
+                        # Only keep points further than the tolerance radius
+                        subtraction_mask = points_to_bg_distances > SUBTRACTION_RADIUS_M
+                        arr = arr[subtraction_mask]
+                        dists = dists[subtraction_mask]
+
+                    # Render Final output frame
                     if len(arr) > 0:
                         pcd.points = o3d.utility.Vector3dVector(arr)
                         norm_dists = np.clip(dists / MAX_COLOR_DIST_M, 0.0, 1.0)
@@ -390,7 +491,7 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
     finally:
         stop_event.set()
 
-        # ── MERGE CAMERA PARAMETERS ON EXIT ──
+        # Save camera orientation states
         try:
             cam_params = vis.get_view_control().convert_to_pinhole_camera_parameters()
             o3d.io.write_pinhole_camera_parameters("temp_cam_save.json", cam_params)
@@ -404,10 +505,9 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
                     file_data = json.load(f)
 
             file_data["camera_view"] = cam_data
-
             with open(CONFIG_FILE, "w") as f:
                 json.dump(file_data, f, indent=4)
-            print("-> Final camera viewpoint saved successfully.")
+            print("-> Camera viewpoint saved successfully.")
         except Exception as e:
             print(f"-> Notice: Could not save camera parameters ({e})")
 
@@ -436,18 +536,18 @@ if __name__ == "__main__":
             with open(CONFIG_FILE, "r") as f:
                 file_data = json.load(f)
 
-            # Load bounds if they exist
             for k in initial_bounds.keys():
                 if k in file_data:
                     initial_bounds[k] = file_data[k]
 
-            # Load camera if it exists
             if "camera_view" in file_data:
                 initial_camera = file_data["camera_view"]
-
-            print(f"-> Loaded existing config (ROI + Camera) from {CONFIG_FILE}")
+            print(f"-> Loaded existing config from {CONFIG_FILE}")
         except Exception:
             print("-> Found corrupted config file. Loading defaults.")
+
+    # Append processing variables for background state sync
+    initial_bounds['bg_state'] = 'idle'
 
     with multiprocessing.Manager() as manager:
         shared_bounds = manager.dict(initial_bounds)
