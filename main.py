@@ -1,14 +1,28 @@
 #!/usr/bin/env python3
 """
 Livox Avia – Direct SDK Viewer
-(Posture Outline + Centroid-Spine + Inclination Measurement)
+(Posture Outline + Three-Segment Spine + Option C Inclination)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Inclination is computed by comparing the X/Y position of the top
-centroid vs the bottom centroid of the spine curve:
+Option C — Three-Segment Angle Model
+  The spine is split into three landmarks:
+    bot  → pelvis / lumbar base  (bottom 25% of centroid slices)
+    mid  → thoracic anchor       (middle third — most stable while sitting)
+    top  → cervical / head       (top 25% of centroid slices)
 
-    angle_X_deg  → forward / backward lean   (+ = leaning toward sensor)
-    angle_Y_deg  → left / right lean          (+ = leaning right)
-    dX_m / dY_m  → raw horizontal offsets in metres
+  Two segments are measured independently:
+    lumbar_fwd_deg  → forward/backward lean of the lower back (bot→mid)
+    lumbar_lat_deg  → left/right lean of the lower back       (bot→mid)
+    fhp_fwd_deg     → forward head posture angle              (mid→top)
+    fhp_lat_deg     → lateral head drift                      (mid→top)
+    relative_fhp_deg → fhp_fwd_deg − lumbar_fwd_deg
+                       Large positive = classic tech-neck on a rounded back
+
+  Visual arrows in the 3-D view:
+    Orange  bot → mid   (lumbar segment)
+    Lime    mid → top   (cervical / FHP segment)
+    Red sphere   = pelvis reference
+    Orange sphere = thoracic anchor
+    Green sphere  = head/neck reference
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -39,7 +53,7 @@ HOST_CMD_PORT   = 60000
 HOST_IMU_PORT   = 60002
 
 HEARTBEAT_INTERVAL_S = 0.1
-FRAME_TIME_S         = 0.5
+FRAME_TIME_S         = 2.5
 MAX_COLOR_DIST_M     = 5.0
 
 CONFIG_FILE = "roi_settings.json"
@@ -48,8 +62,12 @@ BG_PCD_FILE = "background_model.pcd"
 # Number of height slices for the spine centroid curve
 SPINE_SLICES = 50
 
-# Inclination alert threshold (degrees) — printed in a different colour
-LEAN_ALERT_DEG = 10.0
+# ── Option C alert thresholds ──────────────────────────────────────────────────
+# Lower-segment (lumbar) whole-body lean
+LUMBAR_ALERT_DEG    = 15.0
+# Upper-segment RELATIVE forward-head angle vs lumbar baseline
+# 12° = early tech-neck; tune downward (e.g. 8°) for stricter monitoring
+FHP_RELATIVE_ALERT  = 12.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -92,7 +110,74 @@ def create_line_cylinders(pts_3d, lines_idx, color, radius=0.018):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Posture Overlay — Outline + Centroid Spine + Inclination
+#  Option C — Three-Segment Inclination
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def three_segment_inclination(spine_pts):
+    """
+    Split the spine centroid list into three anatomical zones and compute
+    independent angles for each segment.
+
+    Parameters
+    ----------
+    spine_pts : list of [X, Y, Z] centroids, ordered bottom → top
+
+    Returns
+    -------
+    dict with keys:
+        lumbar_fwd_deg   – forward/back lean, lower segment (bot→mid)
+        lumbar_lat_deg   – left/right lean,   lower segment
+        fhp_fwd_deg      – forward/back lean, upper segment (mid→top)
+        fhp_lat_deg      – left/right lean,   upper segment
+        relative_fhp_deg – fhp_fwd − lumbar_fwd  (key bad-office metric)
+        bot_pt / mid_pt / top_pt  – the three landmark positions
+    """
+    pts   = np.array(spine_pts, dtype=float)
+    n     = len(pts)
+
+    # Landmark averaging windows
+    n_end  = max(1, n // 4)          # outer 25% for bot & top
+    n_mid0 = n // 2  # start at 50% of height
+    n_mid1 = 3 * n // 4  # end at 75% of height
+
+    bot = np.mean(pts[:n_end],         axis=0)   # pelvis / lumbar base
+    mid = np.mean(pts[n_mid0:n_mid1], axis=0)
+    top = np.mean(pts[n - n_end:],     axis=0)   # head / cervical
+
+    # ── Lower segment: pelvis → thoracic ──────────────────────────────────────
+    dZ_lower = float(mid[2] - bot[2])
+    if abs(dZ_lower) > 0.03:
+        lumbar_fwd_deg = float(np.degrees(np.arctan2(mid[1] - bot[1], dZ_lower)))
+        lumbar_lat_deg = float(np.degrees(np.arctan2(mid[0] - bot[0], dZ_lower)))
+    else:
+        lumbar_fwd_deg = lumbar_lat_deg = 0.0
+
+    # ── Upper segment: thoracic → head ────────────────────────────────────────
+    dZ_upper = float(top[2] - mid[2])
+    if abs(dZ_upper) > 0.03:
+        fhp_fwd_deg = float(np.degrees(np.arctan2(top[1] - mid[1], dZ_upper)))
+        fhp_lat_deg = float(np.degrees(np.arctan2(top[0] - mid[0], dZ_upper)))
+    else:
+        fhp_fwd_deg = fhp_lat_deg = 0.0
+
+    # ── Relative angle — the primary bad-office-syndrome indicator ─────────────
+    # Positive = head leans further forward than the lumbar baseline
+    relative_fhp_deg = fhp_fwd_deg - lumbar_fwd_deg
+
+    return {
+        "lumbar_fwd_deg":   round(lumbar_fwd_deg,   2),
+        "lumbar_lat_deg":   round(lumbar_lat_deg,   2),
+        "fhp_fwd_deg":      round(fhp_fwd_deg,      2),
+        "fhp_lat_deg":      round(fhp_lat_deg,      2),
+        "relative_fhp_deg": round(relative_fhp_deg, 2),
+        "bot_pt":           bot.tolist(),
+        "mid_pt":           mid.tolist(),
+        "top_pt":           top.tolist(),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Posture Overlay — Outline + Centroid Spine + Option C Inclination
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def extract_spine_and_outline(points):
@@ -102,18 +187,17 @@ def extract_spine_and_outline(points):
 
     Outputs
     -------
-    spine_mesh   : cylinder segments + sphere knots tracing the centroid of
-                   each horizontal body slice — directly shows spinal curvature.
-                   Colour gradient bottom=cyan → top=yellow for height readability.
-                   Also includes a yellow "lean arrow" from bottom centroid to
-                   top centroid to visualise overall inclination direction.
+    spine_mesh   : cylinder segments + sphere knots tracing each horizontal
+                   slice centroid.  Colour gradient cyan (bottom) → yellow (top).
+                   Two directional arrows:
+                     • Orange  bot → mid   (lumbar segment)
+                     • Lime    mid → top   (FHP / cervical segment)
+                   Three reference spheres:
+                     • Red    = pelvis (bot)
+                     • Orange = thoracic anchor (mid)
+                     • Green  = head/neck (top)
     outline_mesh : magenta body-contour cylinder ring.
-    inclination  : dict with keys:
-                     dX_m        – horizontal offset along X axis (lateral)
-                     dY_m        – horizontal offset along Y axis (depth/fwd-back)
-                     angle_X_deg – left/right lean in degrees
-                     angle_Y_deg – forward/backward lean in degrees
-                   Returns None when insufficient data.
+    inclination  : Option C dict from three_segment_inclination(), or None.
     """
     if len(points) < 40:
         return None, None, None
@@ -178,7 +262,6 @@ def extract_spine_and_outline(points):
 
         if len(outline_pts) > 2:
             outline_lines.append([len(outline_pts) - 1, 0])
-            # Smooth depth-axis zigzag with a circular rolling average
             pa = np.array(outline_pts, dtype=float)
             n  = len(pa)
             if n >= 11:
@@ -224,7 +307,7 @@ def extract_spine_and_outline(points):
     spine_mesh  = None
     inclination = None
 
-    if len(spine_pts) >= 2:
+    if len(spine_pts) >= 4:   # need enough slices for three segments
         combined = o3d.geometry.TriangleMesh()
 
         # ── White cylinder bones ───────────────────────────────────────────────
@@ -244,47 +327,37 @@ def extract_spine_and_outline(points):
             sph.compute_vertex_normals()
             combined += sph
 
-        # ── Inclination: compare robust bottom vs top averages ─────────────────
-        #    Use the outer 25% of slices so a single noisy point doesn't skew it
-        n_avg = max(1, n_pts // 4)
-        bot   = np.mean(spine_pts[:n_avg],  axis=0)   # [X, Y, Z]
-        top   = np.mean(spine_pts[-n_avg:], axis=0)
+        # ── Option C: three-segment inclination ───────────────────────────────
+        inclination = three_segment_inclination(spine_pts)
+        bot = np.array(inclination["bot_pt"])
+        mid = np.array(inclination["mid_pt"])
+        top = np.array(inclination["top_pt"])
 
-        dX = float(top[0] - bot[0])   # lateral deviation  (X axis)
-        dY = float(top[1] - bot[1])   # depth deviation    (Y axis)
-        dZ = float(top[2] - bot[2])   # vertical span      (always > 0)
-
-        if abs(dZ) > 0.05:
-            # arctan2 gives the signed angle from vertical in each plane.
-            # Sensor Y-axis is depth → forward/back lean uses dY.
-            # Sensor X-axis is lateral → left/right lean uses dX.
-            angle_fwd_deg = float(np.degrees(np.arctan2(dY, dZ)))  # forward/back
-            angle_lat_deg = float(np.degrees(np.arctan2(dX, dZ)))  # left/right
-        else:
-            angle_fwd_deg = angle_lat_deg = 0.0
-
-        inclination = {
-            "dX_m":        round(dX,          4),
-            "dY_m":        round(dY,          4),
-            "dZ_m":        round(dZ,          4),
-            "angle_X_deg": round(angle_fwd_deg, 2),   # Fwd/Back  (display key kept)
-            "angle_Y_deg": round(angle_lat_deg, 2),   # Left/Right (display key kept)
-            "bot_pt":      bot.tolist(),
-            "top_pt":      top.tolist(),
-        }
-
-        # ── Lean arrow: thick yellow line from bot → top centroid ─────────────
-        arrow = create_line_cylinders(
-            [bot.tolist(), top.tolist()],
+        # ── Arrow 1: Orange  bot → mid  (lumbar segment) ──────────────────────
+        arrow_lumbar = create_line_cylinders(
+            [bot.tolist(), mid.tolist()],
             [[0, 1]],
-            color=[1.0, 1.0, 0.0],   # yellow
+            color=[1.0, 0.55, 0.0],   # orange
             radius=0.030)
-        if arrow is not None:
-            combined += arrow
+        if arrow_lumbar is not None:
+            combined += arrow_lumbar
 
-        # ── Small red sphere at bot reference, green at top reference ──────────
-        for pt, col in [(bot, [1.0, 0.2, 0.2]), (top, [0.2, 1.0, 0.2])]:
-            mk = o3d.geometry.TriangleMesh.create_sphere(radius=0.045, resolution=8)
+        # ── Arrow 2: Lime  mid → top  (FHP / cervical segment) ────────────────
+        arrow_fhp = create_line_cylinders(
+            [mid.tolist(), top.tolist()],
+            [[0, 1]],
+            color=[0.4, 1.0, 0.0],    # lime green
+            radius=0.030)
+        if arrow_fhp is not None:
+            combined += arrow_fhp
+
+        # ── Reference spheres: red=pelvis, orange=thoracic, green=head ─────────
+        for pt, col, rad in [
+            (bot, [1.0, 0.2, 0.2],  0.045),   # red   — pelvis
+            (mid, [1.0, 0.55, 0.0], 0.050),   # orange — thoracic anchor
+            (top, [0.2, 1.0, 0.2],  0.045),   # green  — head/neck
+        ]:
+            mk = o3d.geometry.TriangleMesh.create_sphere(radius=rad, resolution=8)
             mk.translate(np.array(pt, dtype=float))
             mk.paint_uniform_color(col)
             mk.compute_vertex_normals()
@@ -298,30 +371,36 @@ def extract_spine_and_outline(points):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Console inclination printer
+#  Console inclination printer (Option C)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def print_inclination(inc):
-    """Pretty-print inclination dict to stdout with alert highlighting."""
+    """Pretty-print Option C inclination dict to stdout."""
     if inc is None:
         return
-    # angle_X_deg → Fwd/Back  |  angle_Y_deg → Left/Right
-    ax = inc["angle_X_deg"]   # forward / backward
-    ay = inc["angle_Y_deg"]   # left / right
-    dx = inc["dY_m"]          # depth offset  (Y axis = depth)
-    dy = inc["dX_m"]          # lateral offset (X axis = lateral)
 
-    ax_str = f"{ax:+6.1f}°"
-    ay_str = f"{ay:+6.1f}°"
+    lf = inc["lumbar_fwd_deg"]
+    ll = inc["lumbar_lat_deg"]
+    ff = inc["fhp_fwd_deg"]
+    fl = inc["fhp_lat_deg"]
+    rf = inc["relative_fhp_deg"]
 
-    alert = abs(ax) > LEAN_ALERT_DEG or abs(ay) > LEAN_ALERT_DEG
-    tag   = "  ⚠ ALERT" if alert else ""
+    lumbar_alert = abs(lf) > LUMBAR_ALERT_DEG or abs(ll) > LUMBAR_ALERT_DEG
+    fhp_alert    = abs(rf) > FHP_RELATIVE_ALERT
+    alert        = lumbar_alert or fhp_alert
+
+    tag = ""
+    if fhp_alert and lumbar_alert:
+        tag = "  ⚠ ALERT: Lumbar + Forward-Head"
+    elif fhp_alert:
+        tag = "  ⚠ ALERT: Forward-Head Posture"
+    elif lumbar_alert:
+        tag = "  ⚠ ALERT: Lumbar Lean"
 
     print(
-        f"  Inclination │ "
-        f"Fwd/Back: {ax_str}  (Δ{dx:+.3f} m)  │  "
-        f"Left/Right: {ay_str}  (Δ{dy:+.3f} m)"
-        f"{tag}"
+        f"  Lumbar  │ Fwd/Back: {lf:+6.1f}°  Lat: {ll:+6.1f}°\n"
+        f"  FHP     │ Fwd/Back: {ff:+6.1f}°  Lat: {fl:+6.1f}°\n"
+        f"  Relative│ Head vs Lumbar: {rf:+6.1f}°{tag}"
     )
 
 
@@ -394,7 +473,7 @@ def get_human_indices(points, ransac_iters=300, remove_seat=True):
 def roi_control_panel(shared_bounds):
     root = tk.Tk()
     root.title("ROI & Background Panel")
-    root.geometry("360x760")
+    root.geometry("360x860")   # taller to fit the Option C readout
     root.attributes('-topmost', True)
     root.configure(padx=15, pady=15)
 
@@ -456,26 +535,44 @@ def roi_control_panel(shared_bounds):
                                chair_status.config(text="Inactive", fg="gray")),
               bg="#ffebee").pack(side="right", fill="x")
 
-    # ── Inclination readout ───────────────────────────────────────────────────
-    inc_frame = tk.LabelFrame(root, text=" 3. Inclination Readout ",
+    # ── Option C — Three-Segment Inclination readout ──────────────────────────
+    inc_frame = tk.LabelFrame(root, text=" 3. Three-Segment Inclination (Option C) ",
                                font=('Arial', 10, 'bold'), padx=10, pady=5)
     inc_frame.pack(fill="x", pady=5)
 
-    lbl_fwd  = tk.Label(inc_frame, text="Fwd/Back:   —",
-                         font=('Courier', 10), fg="black", anchor='w')
-    lbl_fwd.pack(fill='x')
-    lbl_lat  = tk.Label(inc_frame, text="Left/Right: —",
-                         font=('Courier', 10), fg="black", anchor='w')
-    lbl_lat.pack(fill='x')
-    lbl_dx   = tk.Label(inc_frame, text="Δ depth offset:   —",
-                         font=('Courier', 9), fg="gray", anchor='w')
-    lbl_dx.pack(fill='x')
-    lbl_dy   = tk.Label(inc_frame, text="Δ lateral offset: —",
-                         font=('Courier', 9), fg="gray", anchor='w')
-    lbl_dy.pack(fill='x')
-    lbl_alert = tk.Label(inc_frame, text="",
-                          font=('Arial', 10, 'bold'), fg="red")
-    lbl_alert.pack()
+    # Header row labels
+    tk.Label(inc_frame, text="Segment         Fwd/Back    Lat",
+             font=('Courier', 8), fg="gray", anchor='w').pack(fill='x')
+    tk.Frame(inc_frame, height=1, bg="lightgray").pack(fill='x', pady=2)
+
+    # ● Lumbar row  (bot → thoracic anchor)
+    lbl_lumbar = tk.Label(inc_frame,
+                          text="● Lumbar (bot→mid)    —       —",
+                          font=('Courier', 10), fg="black", anchor='w')
+    lbl_lumbar.pack(fill='x')
+
+    # ● FHP row  (thoracic anchor → head)
+    lbl_fhp    = tk.Label(inc_frame,
+                          text="● FHP    (mid→top)    —       —",
+                          font=('Courier', 10), fg="black", anchor='w')
+    lbl_fhp.pack(fill='x')
+
+    tk.Frame(inc_frame, height=1, bg="lightgray").pack(fill='x', pady=2)
+
+    # Relative angle — the key bad-office metric
+    lbl_rel    = tk.Label(inc_frame,
+                          text="▲ Relative FHP:   —",
+                          font=('Courier', 10, 'bold'), fg="black", anchor='w')
+    lbl_rel.pack(fill='x')
+
+    lbl_alert  = tk.Label(inc_frame, text="",
+                           font=('Arial', 10, 'bold'), fg="red")
+    lbl_alert.pack(pady=(4, 0))
+
+    # Legend
+    tk.Label(inc_frame,
+             text="● orange=thoracic anchor  ● red=pelvis  ● green=head",
+             font=('Arial', 7), fg="gray", anchor='w').pack(fill='x', pady=(4, 0))
 
     def update_shared_dict():
         nonlocal last_saved_values
@@ -506,25 +603,38 @@ def roi_control_panel(shared_bounds):
         elif b_st == 'scanning':
             bg_status.config(text="Scanning empty room...", fg="blue")
 
-        # ── Refresh inclination readout ────────────────────────────────────
+        # ── Refresh Option C inclination readout ──────────────────────────
         inc = shared_bounds.get('inclination')
         if inc:
-            # angle_X_deg → Fwd/Back  |  angle_Y_deg → Left/Right
-            ax = inc.get("angle_X_deg", 0.0)   # forward / backward
-            ay = inc.get("angle_Y_deg", 0.0)   # left / right
-            dx = inc.get("dY_m", 0.0)          # depth offset  (Y axis = depth)
-            dy = inc.get("dX_m", 0.0)          # lateral offset (X axis = lateral)
+            lf = inc.get("lumbar_fwd_deg", 0.0)
+            ll = inc.get("lumbar_lat_deg", 0.0)
+            ff = inc.get("fhp_fwd_deg",    0.0)
+            fl = inc.get("fhp_lat_deg",    0.0)
+            rf = inc.get("relative_fhp_deg", 0.0)
 
-            fx_color = "red" if abs(ax) > LEAN_ALERT_DEG else "black"
-            fy_color = "red" if abs(ay) > LEAN_ALERT_DEG else "black"
+            lumbar_bad = abs(lf) > LUMBAR_ALERT_DEG or abs(ll) > LUMBAR_ALERT_DEG
+            fhp_bad    = abs(rf) > FHP_RELATIVE_ALERT
 
-            lbl_fwd.config(text=f"Fwd/Back:   {ax:+6.1f}°", fg=fx_color)
-            lbl_lat.config(text=f"Left/Right: {ay:+6.1f}°", fg=fy_color)
-            lbl_dx.config(text=f"Δ depth offset:   {dx:+.4f} m")
-            lbl_dy.config(text=f"Δ lateral offset: {dy:+.4f} m")
+            lbl_lumbar.config(
+                text=f"● Lumbar (bot→mid)  {lf:+6.1f}°  {ll:+6.1f}°",
+                fg="red" if lumbar_bad else "#b35a00")   # orange-brown when OK
 
-            if abs(ax) > LEAN_ALERT_DEG or abs(ay) > LEAN_ALERT_DEG:
-                lbl_alert.config(text="⚠ Excessive lean detected!")
+            lbl_fhp.config(
+                text=f"● FHP    (mid→top)  {ff:+6.1f}°  {fl:+6.1f}°",
+                fg="red" if fhp_bad else "dark green")
+
+            rel_color = "red" if fhp_bad else ("dark orange" if abs(rf) > 6 else "black")
+            lbl_rel.config(
+                text=f"▲ Relative FHP:  {rf:+6.1f}°",
+                fg=rel_color)
+
+            # Alert banner
+            if fhp_bad and lumbar_bad:
+                lbl_alert.config(text="⚠ Lumbar + Forward-Head detected!", fg="red")
+            elif fhp_bad:
+                lbl_alert.config(text="⚠ Forward-Head Posture detected!", fg="red")
+            elif lumbar_bad:
+                lbl_alert.config(text="⚠ Excessive lumbar lean detected!", fg="red")
             else:
                 lbl_alert.config(text="✓ Posture within range", fg="green")
 
@@ -623,8 +733,9 @@ def get_box_lineset(min_b, max_b):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def live_livox_viewer(shared_bounds, initial_camera=None):
-    print("  Livox Avia – Posture Viewer (centroid-spine + inclination)\n")
-    print(f"  Alert threshold: ±{LEAN_ALERT_DEG}°\n")
+    print("  Livox Avia – Posture Viewer (Option C: Three-Segment Spine)\n")
+    print(f"  Lumbar alert:  ±{LUMBAR_ALERT_DEG}°")
+    print(f"  FHP relative alert: >{FHP_RELATIVE_ALERT}°\n")
 
     bcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     bcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -676,7 +787,7 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
     data_sock.setblocking(False)
 
     vis = o3d.visualization.Visualizer()
-    vis.create_window("Livox Avia – Posture Viewer", 1280, 720)
+    vis.create_window("Livox Avia – Posture Viewer (Option C)", 1280, 720)
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(np.zeros((1, 3)))
@@ -809,7 +920,6 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
                             arr_h   = arr[human_mask]
                             dists_h = dists[human_mask]
 
-                            # DBSCAN: keep only the largest connected body cluster
                             if len(arr_h) > 20:
                                 _tmp = o3d.geometry.PointCloud()
                                 _tmp.points = o3d.utility.Vector3dVector(arr_h)
@@ -826,11 +936,10 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
                             else:
                                 arr, dists = arr_h, dists_h
 
-                            # Spine curve + body outline + inclination
+                            # Option C spine + outline
                             active_spine_geom, active_outline_geom, inclination = \
                                 extract_spine_and_outline(arr)
 
-                            # Share inclination with GUI panel
                             if inclination is not None:
                                 shared_bounds['inclination'] = inclination
                                 print_inclination(inclination)
