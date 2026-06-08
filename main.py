@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
 Livox Avia – Direct SDK Viewer
-(Posture Outline + Centroid-Spine — no external ML model required)
+(Posture Outline + Centroid-Spine + Inclination Measurement)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Inclination is computed by comparing the X/Y position of the top
+centroid vs the bottom centroid of the spine curve:
+
+    angle_X_deg  → forward / backward lean   (+ = leaning toward sensor)
+    angle_Y_deg  → left / right lean          (+ = leaning right)
+    dX_m / dY_m  → raw horizontal offsets in metres
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -31,15 +38,18 @@ HOST_DATA_PORT  = 60001
 HOST_CMD_PORT   = 60000
 HOST_IMU_PORT   = 60002
 
-HEARTBEAT_INTERVAL_S = 1.0
-FRAME_TIME_S         = 2
+HEARTBEAT_INTERVAL_S = 0.1
+FRAME_TIME_S         = 0.5
 MAX_COLOR_DIST_M     = 5.0
 
 CONFIG_FILE = "roi_settings.json"
 BG_PCD_FILE = "background_model.pcd"
 
 # Number of height slices for the spine centroid curve
-SPINE_SLICES = 10
+SPINE_SLICES = 50
+
+# Inclination alert threshold (degrees) — printed in a different colour
+LEAN_ALERT_DEG = 10.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -82,7 +92,7 @@ def create_line_cylinders(pts_3d, lines_idx, color, radius=0.018):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Posture Overlay — Outline + Centroid Spine
+#  Posture Overlay — Outline + Centroid Spine + Inclination
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def extract_spine_and_outline(points):
@@ -95,10 +105,18 @@ def extract_spine_and_outline(points):
     spine_mesh   : cylinder segments + sphere knots tracing the centroid of
                    each horizontal body slice — directly shows spinal curvature.
                    Colour gradient bottom=cyan → top=yellow for height readability.
+                   Also includes a yellow "lean arrow" from bottom centroid to
+                   top centroid to visualise overall inclination direction.
     outline_mesh : magenta body-contour cylinder ring.
+    inclination  : dict with keys:
+                     dX_m        – horizontal offset along X axis (lateral)
+                     dY_m        – horizontal offset along Y axis (depth/fwd-back)
+                     angle_X_deg – left/right lean in degrees
+                     angle_Y_deg – forward/backward lean in degrees
+                   Returns None when insufficient data.
     """
     if len(points) < 40:
-        return None, None
+        return None, None, None
 
     # ── Project onto YZ plane (look from X axis) ──────────────────────────────
     horiz = points[:, 1]   # Y → horizontal
@@ -108,7 +126,7 @@ def extract_spine_and_outline(points):
     h_min, h_max = np.min(horiz), np.max(horiz)
     v_min, v_max = np.min(vert),  np.max(vert)
     if h_max == h_min or v_max == v_min:
-        return None, None
+        return None, None, None
 
     h_pad = (h_max - h_min) * 0.1;  v_pad = (v_max - v_min) * 0.1
     h_min -= h_pad;  h_max += h_pad
@@ -184,7 +202,7 @@ def extract_spine_and_outline(points):
     body    = points[(z_vals >= z_lo) & (z_vals <= z_hi)]
 
     if len(body) < 20:
-        return None, outline_mesh
+        return None, outline_mesh, None
 
     bz             = body[:, 2]
     bz_min, bz_max = float(np.min(bz)), float(np.max(bz))
@@ -203,32 +221,108 @@ def extract_spine_and_outline(points):
         if len(spine_pts) > 1:
             spine_lines.append([len(spine_pts) - 2, len(spine_pts) - 1])
 
-    spine_mesh = None
+    spine_mesh  = None
+    inclination = None
+
     if len(spine_pts) >= 2:
         combined = o3d.geometry.TriangleMesh()
 
-        # White cylinder bones
+        # ── White cylinder bones ───────────────────────────────────────────────
         cyl = create_line_cylinders(
             spine_pts, spine_lines, [1.0, 1.0, 1.0], radius=0.022)
         if cyl is not None:
             combined += cyl
 
-        # Coloured sphere knots — cyan (bottom) → yellow (top)
+        # ── Coloured sphere knots — cyan (bottom) → yellow (top) ──────────────
         n_pts = len(spine_pts)
         for j, pt in enumerate(spine_pts):
-            t     = j / max(n_pts - 1, 1)          # 0.0 at bottom, 1.0 at top
-            color = [t, 1.0, 1.0 - t]              # cyan → yellow
+            t     = j / max(n_pts - 1, 1)      # 0.0 at bottom, 1.0 at top
+            color = [t, 1.0, 1.0 - t]          # cyan → yellow
             sph   = o3d.geometry.TriangleMesh.create_sphere(radius=0.035, resolution=8)
             sph.translate(np.array(pt, dtype=float))
             sph.paint_uniform_color(color)
             sph.compute_vertex_normals()
             combined += sph
 
+        # ── Inclination: compare robust bottom vs top averages ─────────────────
+        #    Use the outer 25% of slices so a single noisy point doesn't skew it
+        n_avg = max(1, n_pts // 4)
+        bot   = np.mean(spine_pts[:n_avg],  axis=0)   # [X, Y, Z]
+        top   = np.mean(spine_pts[-n_avg:], axis=0)
+
+        dX = float(top[0] - bot[0])   # lateral deviation  (X axis)
+        dY = float(top[1] - bot[1])   # depth deviation    (Y axis)
+        dZ = float(top[2] - bot[2])   # vertical span      (always > 0)
+
+        if abs(dZ) > 0.05:
+            # arctan2 gives the signed angle from vertical in each plane.
+            # Sensor Y-axis is depth → forward/back lean uses dY.
+            # Sensor X-axis is lateral → left/right lean uses dX.
+            angle_fwd_deg = float(np.degrees(np.arctan2(dY, dZ)))  # forward/back
+            angle_lat_deg = float(np.degrees(np.arctan2(dX, dZ)))  # left/right
+        else:
+            angle_fwd_deg = angle_lat_deg = 0.0
+
+        inclination = {
+            "dX_m":        round(dX,          4),
+            "dY_m":        round(dY,          4),
+            "dZ_m":        round(dZ,          4),
+            "angle_X_deg": round(angle_fwd_deg, 2),   # Fwd/Back  (display key kept)
+            "angle_Y_deg": round(angle_lat_deg, 2),   # Left/Right (display key kept)
+            "bot_pt":      bot.tolist(),
+            "top_pt":      top.tolist(),
+        }
+
+        # ── Lean arrow: thick yellow line from bot → top centroid ─────────────
+        arrow = create_line_cylinders(
+            [bot.tolist(), top.tolist()],
+            [[0, 1]],
+            color=[1.0, 1.0, 0.0],   # yellow
+            radius=0.030)
+        if arrow is not None:
+            combined += arrow
+
+        # ── Small red sphere at bot reference, green at top reference ──────────
+        for pt, col in [(bot, [1.0, 0.2, 0.2]), (top, [0.2, 1.0, 0.2])]:
+            mk = o3d.geometry.TriangleMesh.create_sphere(radius=0.045, resolution=8)
+            mk.translate(np.array(pt, dtype=float))
+            mk.paint_uniform_color(col)
+            mk.compute_vertex_normals()
+            combined += mk
+
         if len(np.asarray(combined.vertices)) > 0:
             combined.compute_vertex_normals()
             spine_mesh = combined
 
-    return spine_mesh, outline_mesh
+    return spine_mesh, outline_mesh, inclination
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Console inclination printer
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def print_inclination(inc):
+    """Pretty-print inclination dict to stdout with alert highlighting."""
+    if inc is None:
+        return
+    # angle_X_deg → Fwd/Back  |  angle_Y_deg → Left/Right
+    ax = inc["angle_X_deg"]   # forward / backward
+    ay = inc["angle_Y_deg"]   # left / right
+    dx = inc["dY_m"]          # depth offset  (Y axis = depth)
+    dy = inc["dX_m"]          # lateral offset (X axis = lateral)
+
+    ax_str = f"{ax:+6.1f}°"
+    ay_str = f"{ay:+6.1f}°"
+
+    alert = abs(ax) > LEAN_ALERT_DEG or abs(ay) > LEAN_ALERT_DEG
+    tag   = "  ⚠ ALERT" if alert else ""
+
+    print(
+        f"  Inclination │ "
+        f"Fwd/Back: {ax_str}  (Δ{dx:+.3f} m)  │  "
+        f"Left/Right: {ay_str}  (Δ{dy:+.3f} m)"
+        f"{tag}"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -300,7 +394,7 @@ def get_human_indices(points, ransac_iters=300, remove_seat=True):
 def roi_control_panel(shared_bounds):
     root = tk.Tk()
     root.title("ROI & Background Panel")
-    root.geometry("360x680")
+    root.geometry("360x760")
     root.attributes('-topmost', True)
     root.configure(padx=15, pady=15)
 
@@ -321,6 +415,7 @@ def roi_control_panel(shared_bounds):
 
     tk.Frame(root, height=2, bd=1, relief="sunken").pack(fill="x", pady=10)
 
+    # ── Background calibration ────────────────────────────────────────────────
     bg_frame  = tk.LabelFrame(root, text=" 1. Background (Floor/Walls) ",
                                font=('Arial', 10, 'bold'), padx=10, pady=5)
     bg_frame.pack(fill="x", pady=5)
@@ -344,6 +439,7 @@ def roi_control_panel(shared_bounds):
               command=lambda: shared_bounds.update({'bg_state': 'clear'}),
               bg="#ffebee").pack(side="right", fill="x")
 
+    # ── Chair / human filter ──────────────────────────────────────────────────
     chair_frame  = tk.LabelFrame(root, text=" 2. Human Extraction (Chair Filter) ",
                                   font=('Arial', 10, 'bold'), padx=10, pady=5)
     chair_frame.pack(fill="x", pady=5)
@@ -359,6 +455,27 @@ def roi_control_panel(shared_bounds):
               command=lambda: (shared_bounds.update({'chair_state': 'idle'}),
                                chair_status.config(text="Inactive", fg="gray")),
               bg="#ffebee").pack(side="right", fill="x")
+
+    # ── Inclination readout ───────────────────────────────────────────────────
+    inc_frame = tk.LabelFrame(root, text=" 3. Inclination Readout ",
+                               font=('Arial', 10, 'bold'), padx=10, pady=5)
+    inc_frame.pack(fill="x", pady=5)
+
+    lbl_fwd  = tk.Label(inc_frame, text="Fwd/Back:   —",
+                         font=('Courier', 10), fg="black", anchor='w')
+    lbl_fwd.pack(fill='x')
+    lbl_lat  = tk.Label(inc_frame, text="Left/Right: —",
+                         font=('Courier', 10), fg="black", anchor='w')
+    lbl_lat.pack(fill='x')
+    lbl_dx   = tk.Label(inc_frame, text="Δ depth offset:   —",
+                         font=('Courier', 9), fg="gray", anchor='w')
+    lbl_dx.pack(fill='x')
+    lbl_dy   = tk.Label(inc_frame, text="Δ lateral offset: —",
+                         font=('Courier', 9), fg="gray", anchor='w')
+    lbl_dy.pack(fill='x')
+    lbl_alert = tk.Label(inc_frame, text="",
+                          font=('Arial', 10, 'bold'), fg="red")
+    lbl_alert.pack()
 
     def update_shared_dict():
         nonlocal last_saved_values
@@ -379,6 +496,8 @@ def roi_control_panel(shared_bounds):
                 last_saved_values = current_vals
             except Exception:
                 pass
+
+        # ── Refresh background status ──────────────────────────────────────
         b_st = shared_bounds.get('bg_state', 'idle')
         if b_st == 'active':
             bg_status.config(text="Active (Room Hidden)", fg="green")
@@ -386,6 +505,29 @@ def roi_control_panel(shared_bounds):
             bg_status.config(text="Inactive", fg="gray")
         elif b_st == 'scanning':
             bg_status.config(text="Scanning empty room...", fg="blue")
+
+        # ── Refresh inclination readout ────────────────────────────────────
+        inc = shared_bounds.get('inclination')
+        if inc:
+            # angle_X_deg → Fwd/Back  |  angle_Y_deg → Left/Right
+            ax = inc.get("angle_X_deg", 0.0)   # forward / backward
+            ay = inc.get("angle_Y_deg", 0.0)   # left / right
+            dx = inc.get("dY_m", 0.0)          # depth offset  (Y axis = depth)
+            dy = inc.get("dX_m", 0.0)          # lateral offset (X axis = lateral)
+
+            fx_color = "red" if abs(ax) > LEAN_ALERT_DEG else "black"
+            fy_color = "red" if abs(ay) > LEAN_ALERT_DEG else "black"
+
+            lbl_fwd.config(text=f"Fwd/Back:   {ax:+6.1f}°", fg=fx_color)
+            lbl_lat.config(text=f"Left/Right: {ay:+6.1f}°", fg=fy_color)
+            lbl_dx.config(text=f"Δ depth offset:   {dx:+.4f} m")
+            lbl_dy.config(text=f"Δ lateral offset: {dy:+.4f} m")
+
+            if abs(ax) > LEAN_ALERT_DEG or abs(ay) > LEAN_ALERT_DEG:
+                lbl_alert.config(text="⚠ Excessive lean detected!")
+            else:
+                lbl_alert.config(text="✓ Posture within range", fg="green")
+
         root.after(100, update_shared_dict)
 
     update_shared_dict()
@@ -425,9 +567,9 @@ def cmd_handshake(host_ip, dp, cp, ip):
     return build_cmd(0x00, 0x01,
                      socket.inet_aton(host_ip) + struct.pack('<HHH', dp, cp, ip),
                      cmd_type=0x01)
-def cmd_heartbeat():      return build_cmd(0x00, 0x03)
+def cmd_heartbeat():          return build_cmd(0x00, 0x03)
 def cmd_start_sampling(s=True): return build_cmd(0x00, 0x04, bytes([0x01 if s else 0x00]))
-def cmd_set_cartesian():  return build_cmd(0x00, 0x05, bytes([0x00]))
+def cmd_set_cartesian():      return build_cmd(0x00, 0x05, bytes([0x00]))
 
 _DATA_HDR = 18
 def parse_data_packet(data):
@@ -481,7 +623,8 @@ def get_box_lineset(min_b, max_b):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def live_livox_viewer(shared_bounds, initial_camera=None):
-    print("  Livox Avia – Posture Viewer (centroid-spine, no ML model)\n")
+    print("  Livox Avia – Posture Viewer (centroid-spine + inclination)\n")
+    print(f"  Alert threshold: ±{LEAN_ALERT_DEG}°\n")
 
     bcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     bcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -569,18 +712,19 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
                 background_pcd = None
         except Exception: pass
 
-    bg_accumulating   = False
+    bg_accumulating    = False
     bg_accumulated_pts = []
-    bg_start_time     = 0.0
+    bg_start_time      = 0.0
 
-    accumulated_pts   = []
-    last_render_time  = time.time()
+    accumulated_pts  = []
+    last_render_time = time.time()
 
-    active_spine_geom   = None   # TriangleMesh | None
-    active_outline_geom = None   # TriangleMesh | None
+    active_spine_geom   = None
+    active_outline_geom = None
 
     try:
         while True:
+            # ── Drain UDP buffer ───────────────────────────────────────────────
             while True:
                 try:
                     pkt, _ = data_sock.recvfrom(1500)
@@ -620,7 +764,7 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
                     arr   = arr[roi_mask]
                     dists = dists[roi_mask]
 
-                    # ── Background cancellation ──────────────────────────────
+                    # ── Background cancellation ────────────────────────────────
                     bg_state = shared_bounds.get('bg_state', 'idle')
                     if bg_state == 'clear':
                         background_pcd = None;  bg_accumulating = False
@@ -656,7 +800,7 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
                         arr   = arr[d2bg > 0.06]
                         dists = dists[d2bg > 0.06]
 
-                    # ── Human extraction + posture overlays ──────────────────
+                    # ── Human extraction + posture overlays ────────────────────
                     chair_state = shared_bounds.get('chair_state', 'idle')
 
                     if chair_state == 'active' and len(arr) > 20:
@@ -682,16 +826,23 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
                             else:
                                 arr, dists = arr_h, dists_h
 
-                            # Spine curve + body outline (X-axis projection)
-                            active_spine_geom, active_outline_geom = \
+                            # Spine curve + body outline + inclination
+                            active_spine_geom, active_outline_geom, inclination = \
                                 extract_spine_and_outline(arr)
+
+                            # Share inclination with GUI panel
+                            if inclination is not None:
+                                shared_bounds['inclination'] = inclination
+                                print_inclination(inclination)
+                            else:
+                                shared_bounds['inclination'] = None
 
                     if active_spine_geom is not None:
                         vis.add_geometry(active_spine_geom,   reset_bounding_box=False)
                     if active_outline_geom is not None:
                         vis.add_geometry(active_outline_geom, reset_bounding_box=False)
 
-                    # Render point cloud
+                    # ── Render point cloud ─────────────────────────────────────
                     if len(arr) > 0:
                         pcd.points = o3d.utility.Vector3dVector(arr)
                         nd = np.clip(dists / MAX_COLOR_DIST_M, 0.0, 1.0)
@@ -734,6 +885,10 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
         cmd_sock.close();  data_sock.close();  vis.destroy_window()
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Entry Point
+# ═══════════════════════════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     initial_bounds = {'X1': -5.0, 'X2': 5.0, 'Y1': -5.0, 'Y2': 5.0,
@@ -748,7 +903,8 @@ if __name__ == "__main__":
             if "camera_view" in file_data: initial_camera = file_data["camera_view"]
         except Exception: pass
 
-    initial_bounds.update({'bg_state': 'idle', 'chair_state': 'idle'})
+    initial_bounds.update({'bg_state': 'idle', 'chair_state': 'idle',
+                           'inclination': None})
 
     with multiprocessing.Manager() as manager:
         shared_bounds = manager.dict(initial_bounds)
