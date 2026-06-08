@@ -23,6 +23,19 @@ Option C — Three-Segment Angle Model
     Red sphere   = pelvis reference
     Orange sphere = thoracic anchor
     Green sphere  = head/neck reference
+
+  NEW — Noise reduction pipeline:
+    1. Spatial NMS  (nms_spine_centroids)
+       Per-frame: centroid slices that jump laterally beyond 0.12 m
+       from their neighbours are suppressed before angles are computed.
+       Two passes so chains of bad points are cleaned up.
+
+    2. Temporal smoothing  (TemporalSmoother)
+       Cross-frame: 5-frame rolling buffer per angle metric.
+       Any frame whose value lies > 1.5 σ from the buffer mean is
+       excluded before averaging (z-score outlier rejection).
+       Hard clip of ±60° discards physically impossible readings
+       before they even enter the buffer.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -30,6 +43,7 @@ import os
 os.environ['GLOG_minloglevel'] = '3'
 os.environ['GRPC_VERBOSITY']   = 'NONE'
 
+import collections
 import socket
 import struct
 import threading
@@ -53,21 +67,37 @@ HOST_CMD_PORT   = 60000
 HOST_IMU_PORT   = 60002
 
 HEARTBEAT_INTERVAL_S = 0.1
-FRAME_TIME_S         = 2.5
-MAX_COLOR_DIST_M     = 5.0
+FRAME_TIME_S         = 3
+MAX_COLOR_DIST_M     = 5
+
 
 CONFIG_FILE = "roi_settings.json"
 BG_PCD_FILE = "background_model.pcd"
 
 # Number of height slices for the spine centroid curve
-SPINE_SLICES = 50
+SPINE_SLICES = 100
 
 # ── Option C alert thresholds ──────────────────────────────────────────────────
-# Lower-segment (lumbar) whole-body lean
-LUMBAR_ALERT_DEG    = 15.0
+# Forward-plane angles only.
+# Lateral (left/right) angles are computed and stored for reference but are
+# intentionally excluded from all alert logic — LiDAR angular resolution and
+# depth-based estimation make lateral measurements too unreliable for seated
+# posture assessment.  If a future sensor/mount improves lateral accuracy,
+# add `abs(ll) > LUMBAR_ALERT_DEG` back into the lumbar_alert expressions.
+LUMBAR_ALERT_DEG   = 15.0
 # Upper-segment RELATIVE forward-head angle vs lumbar baseline
 # 12° = early tech-neck; tune downward (e.g. 8°) for stricter monitoring
-FHP_RELATIVE_ALERT  = 12.0
+FHP_RELATIVE_ALERT = 12.0
+
+# ── Spatial NMS ────────────────────────────────────────────────────────────────
+# Max lateral deviation (m) a centroid slice may have from its neighbours
+NMS_LAT_THRESH  = 0.12
+NMS_ITERATIONS  = 2      # passes; extra passes clean up chains of bad points
+
+# ── Temporal smoother ──────────────────────────────────────────────────────────
+SMOOTH_WINDOW    = 5     # frames kept in rolling buffer
+SMOOTH_Z_THRESH  = 1.5   # σ — frames beyond this are excluded from average
+SMOOTH_HARD_CLIP = 60.0  # °  — readings outside ±clip never enter buffer
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -110,6 +140,164 @@ def create_line_cylinders(pts_3d, lines_idx, color, radius=0.018):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Spatial NMS — per-frame centroid outlier suppression
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def nms_spine_centroids(spine_pts, lat_thresh=NMS_LAT_THRESH, iterations=NMS_ITERATIONS):
+    """
+    Spatial NMS on the spine centroid list.
+
+    Each interior centroid is compared against its immediate neighbours.
+    If the lateral (XY-plane) deviation from the linear interpolation
+    between those neighbours exceeds `lat_thresh` metres, the point is
+    suppressed.  Multiple passes handle chains of consecutive bad points.
+
+    The first and last points are never removed so the lumbar/head
+    anchor zones always have at least one sample.
+
+    Parameters
+    ----------
+    spine_pts   : list of [X, Y, Z] ordered bottom → top
+    lat_thresh  : max allowed XY deviation from neighbour midpoint (m)
+    iterations  : number of suppression passes
+
+    Returns
+    -------
+    Filtered list in the same [X, Y, Z] format.
+    Falls back to the original list if fewer than 4 points survive.
+    """
+    pts = spine_pts
+    for _ in range(iterations):
+        if len(pts) < 3:
+            break
+        arr  = np.array(pts, dtype=float)
+        keep = np.ones(len(arr), dtype=bool)
+        for i in range(1, len(arr) - 1):
+            # Expected XY = linear interpolation of immediate neighbours
+            expected_xy = (arr[i - 1, :2] + arr[i + 1, :2]) * 0.5
+            dev = np.linalg.norm(arr[i, :2] - expected_xy)
+            if dev > lat_thresh:
+                keep[i] = False
+        filtered = arr[keep].tolist()
+        if len(filtered) >= 4:
+            pts = filtered
+        # If too many points removed this pass, stop early
+        else:
+            break
+    return pts
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Temporal Smoother — 5-frame rolling average with z-score outlier rejection
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TemporalSmoother:
+    """
+    Rolling N-frame buffer for inclination angles with z-score outlier rejection.
+
+    Each frame's angles are added to per-metric circular buffers.  When a
+    smoothed value is requested, frames whose value lies more than
+    `z_thresh` standard deviations from the buffer mean are excluded
+    before the average is taken.
+
+    This removes single-frame spikes (chair creak, sensor glitch, partial
+    occlusion) without adding noticeable lag for genuine posture changes.
+
+    A `hard_clip` gate discards physically impossible readings before they
+    even enter the buffer (e.g. a 90° spike from a spurious point cluster).
+
+    Usage
+    -----
+        smoother = TemporalSmoother()
+        smoothed_inc = smoother.update(raw_inc_dict)
+
+    `relative_fhp_deg` is re-derived from the smoothed fhp/lumbar values
+    rather than smoothed independently, so all three displayed numbers
+    stay self-consistent.
+    """
+
+    ANGLE_KEYS = (
+        "lumbar_fwd_deg",
+        "lumbar_lat_deg",
+        "fhp_fwd_deg",
+        "fhp_lat_deg",
+        "relative_fhp_deg",
+    )
+
+    def __init__(
+        self,
+        window: int   = SMOOTH_WINDOW,
+        z_thresh: float = SMOOTH_Z_THRESH,
+        hard_clip: float = SMOOTH_HARD_CLIP,
+    ):
+        """
+        Parameters
+        ----------
+        window    : number of recent frames to keep (rolling)
+        z_thresh  : frames beyond this many σ from the buffer mean are excluded
+        hard_clip : readings outside ±hard_clip degrees never enter the buffer
+        """
+        self.window    = window
+        self.z_thresh  = z_thresh
+        self.hard_clip = hard_clip
+        self._bufs: dict = {
+            k: collections.deque(maxlen=window) for k in self.ANGLE_KEYS
+        }
+
+    # ── public ────────────────────────────────────────────────────────────────
+
+    def update(self, inc: dict) -> dict:
+        """
+        Push a new raw inclination dict and return a smoothed copy.
+
+        Non-angle keys (bot_pt / mid_pt / top_pt) pass through unchanged
+        so the 3-D landmarks always reflect the current frame position.
+        """
+        result = dict(inc)  # preserve landmark positions as-is
+
+        # Smooth fwd/lat angles independently
+        for k in ("lumbar_fwd_deg", "lumbar_lat_deg", "fhp_fwd_deg", "fhp_lat_deg"):
+            raw = float(inc.get(k, 0.0))
+            if abs(raw) <= self.hard_clip:          # hard gate
+                self._bufs[k].append(raw)
+            result[k] = round(self._robust_mean(self._bufs[k]), 2)
+
+        # Re-derive relative FHP from the already-smoothed components so the
+        # three displayed numbers are always self-consistent (not independently
+        # smoothed versions of each other).
+        result["relative_fhp_deg"] = round(
+            result["fhp_fwd_deg"] - result["lumbar_fwd_deg"], 2)
+
+        # Keep the derived buffer in sync for alert logic, but don't feed raw
+        self._bufs["relative_fhp_deg"].append(result["relative_fhp_deg"])
+
+        return result
+
+    def reset(self):
+        """Clear all buffers (call when the person leaves the frame)."""
+        for buf in self._bufs.values():
+            buf.clear()
+
+    # ── private ───────────────────────────────────────────────────────────────
+
+    def _robust_mean(self, buf: collections.deque) -> float:
+        """Mean of buffer values after removing z-score outliers."""
+        if len(buf) == 0:
+            return 0.0
+        arr  = np.array(buf, dtype=float)
+        mean = float(np.mean(arr))
+        if len(arr) == 1:
+            return mean
+        std = float(np.std(arr))
+        if std < 1e-6:          # all values identical → no outlier logic needed
+            return mean
+        mask = np.abs(arr - mean) <= self.z_thresh * std
+        kept = arr[mask]
+        # Fallback: if the filter removes everything, use the unfiltered mean
+        return float(np.mean(kept)) if len(kept) > 0 else mean
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Option C — Three-Segment Inclination
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -136,13 +324,13 @@ def three_segment_inclination(spine_pts):
     n     = len(pts)
 
     # Landmark averaging windows
-    n_end  = max(1, n // 4)          # outer 25% for bot & top
-    n_mid0 = n // 2  # start at 50% of height
-    n_mid1 = 3 * n // 4  # end at 75% of height
+    n_end  = max(1, n // 4)        # outer 25% for bot & top
+    n_mid0 = n // 2                # start at 50% of height
+    n_mid1 = 3 * n // 4           # end at 75% of height
 
-    bot = np.mean(pts[:n_end],         axis=0)   # pelvis / lumbar base
-    mid = np.mean(pts[n_mid0:n_mid1], axis=0)
-    top = np.mean(pts[n - n_end:],     axis=0)   # head / cervical
+    bot = np.mean(pts[:n_end],          axis=0)   # pelvis / lumbar base
+    mid = np.mean(pts[n_mid0:n_mid1],  axis=0)
+    top = np.mean(pts[n - n_end:],      axis=0)   # head / cervical
 
     # ── Lower segment: pelvis → thoracic ──────────────────────────────────────
     dZ_lower = float(mid[2] - bot[2])
@@ -185,6 +373,14 @@ def extract_spine_and_outline(points):
     Projection: fixed X-axis view → project onto the YZ plane
                 (Y = horizontal, Z = vertical).
 
+    Pipeline
+    --------
+    1. Slice the body into SPINE_SLICES horizontal bands.
+    2. Compute per-band centroid → raw spine_pts list.
+    3. Spatial NMS pass (nms_spine_centroids) to remove lateral outliers.
+    4. Rebuild spine lines from the cleaned list.
+    5. Compute three-segment inclination on cleaned spine.
+
     Outputs
     -------
     spine_mesh   : cylinder segments + sphere knots tracing each horizontal
@@ -198,6 +394,8 @@ def extract_spine_and_outline(points):
                      • Green  = head/neck (top)
     outline_mesh : magenta body-contour cylinder ring.
     inclination  : Option C dict from three_segment_inclination(), or None.
+                   NOTE: these are raw per-frame values; caller applies
+                   TemporalSmoother before storing / displaying.
     """
     if len(points) < 40:
         return None, None, None
@@ -292,7 +490,6 @@ def extract_spine_and_outline(points):
     step           = (bz_max - bz_min) / SPINE_SLICES
 
     spine_pts   = []
-    spine_lines = []
 
     for i in range(SPINE_SLICES):
         lo, hi = bz_min + i * step, bz_min + (i + 1) * step
@@ -301,22 +498,32 @@ def extract_spine_and_outline(points):
             continue
         centroid = body[mask].mean(axis=0)
         spine_pts.append(centroid.tolist())
-        if len(spine_pts) > 1:
-            spine_lines.append([len(spine_pts) - 2, len(spine_pts) - 1])
 
     spine_mesh  = None
     inclination = None
 
-    if len(spine_pts) >= 4:   # need enough slices for three segments
+    if len(spine_pts) >= 4:
+
+        # ── Spatial NMS: suppress per-slice lateral outliers ──────────────────
+        spine_pts = nms_spine_centroids(
+            spine_pts, lat_thresh=NMS_LAT_THRESH, iterations=NMS_ITERATIONS)
+
+        # Rebuild line index list from the cleaned (possibly shorter) point list
+        spine_lines = [[i, i + 1] for i in range(len(spine_pts) - 1)]
+
+        if len(spine_pts) < 4:
+            return None, outline_mesh, None
+
+        # ── Build mesh ────────────────────────────────────────────────────────
         combined = o3d.geometry.TriangleMesh()
 
-        # ── White cylinder bones ───────────────────────────────────────────────
+        # White cylinder bones
         cyl = create_line_cylinders(
             spine_pts, spine_lines, [1.0, 1.0, 1.0], radius=0.022)
         if cyl is not None:
             combined += cyl
 
-        # ── Coloured sphere knots — cyan (bottom) → yellow (top) ──────────────
+        # Coloured sphere knots — cyan (bottom) → yellow (top)
         n_pts = len(spine_pts)
         for j, pt in enumerate(spine_pts):
             t     = j / max(n_pts - 1, 1)      # 0.0 at bottom, 1.0 at top
@@ -333,7 +540,7 @@ def extract_spine_and_outline(points):
         mid = np.array(inclination["mid_pt"])
         top = np.array(inclination["top_pt"])
 
-        # ── Arrow 1: Orange  bot → mid  (lumbar segment) ──────────────────────
+        # Arrow 1: Orange  bot → mid  (lumbar segment)
         arrow_lumbar = create_line_cylinders(
             [bot.tolist(), mid.tolist()],
             [[0, 1]],
@@ -342,7 +549,7 @@ def extract_spine_and_outline(points):
         if arrow_lumbar is not None:
             combined += arrow_lumbar
 
-        # ── Arrow 2: Lime  mid → top  (FHP / cervical segment) ────────────────
+        # Arrow 2: Lime  mid → top  (FHP / cervical segment)
         arrow_fhp = create_line_cylinders(
             [mid.tolist(), top.tolist()],
             [[0, 1]],
@@ -351,9 +558,9 @@ def extract_spine_and_outline(points):
         if arrow_fhp is not None:
             combined += arrow_fhp
 
-        # ── Reference spheres: red=pelvis, orange=thoracic, green=head ─────────
+        # Reference spheres: red=pelvis, orange=thoracic, green=head
         for pt, col, rad in [
-            (bot, [1.0, 0.2, 0.2],  0.045),   # red   — pelvis
+            (bot, [1.0, 0.2, 0.2],  0.045),   # red    — pelvis
             (mid, [1.0, 0.55, 0.0], 0.050),   # orange — thoracic anchor
             (top, [0.2, 1.0, 0.2],  0.045),   # green  — head/neck
         ]:
@@ -375,19 +582,26 @@ def extract_spine_and_outline(points):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def print_inclination(inc):
-    """Pretty-print Option C inclination dict to stdout."""
+    """
+    Pretty-print Option C inclination dict to stdout.
+
+    Alert logic uses forward-plane angles only.
+    Lateral (left/right) values are printed for reference but are NOT
+    used for any alert decision — LiDAR lateral accuracy is insufficient
+    for reliable left/right posture assessment.
+    """
     if inc is None:
         return
 
     lf = inc["lumbar_fwd_deg"]
-    ll = inc["lumbar_lat_deg"]
+    ll = inc["lumbar_lat_deg"]   # reference only — not used in alerts
     ff = inc["fhp_fwd_deg"]
-    fl = inc["fhp_lat_deg"]
+    fl = inc["fhp_lat_deg"]      # reference only — not used in alerts
     rf = inc["relative_fhp_deg"]
 
-    lumbar_alert = abs(lf) > LUMBAR_ALERT_DEG or abs(ll) > LUMBAR_ALERT_DEG
+    # Forward-plane only
+    lumbar_alert = abs(lf) > LUMBAR_ALERT_DEG
     fhp_alert    = abs(rf) > FHP_RELATIVE_ALERT
-    alert        = lumbar_alert or fhp_alert
 
     tag = ""
     if fhp_alert and lumbar_alert:
@@ -398,8 +612,8 @@ def print_inclination(inc):
         tag = "  ⚠ ALERT: Lumbar Lean"
 
     print(
-        f"  Lumbar  │ Fwd/Back: {lf:+6.1f}°  Lat: {ll:+6.1f}°\n"
-        f"  FHP     │ Fwd/Back: {ff:+6.1f}°  Lat: {fl:+6.1f}°\n"
+        f"  Lumbar  │ Fwd/Back: {lf:+6.1f}°  Lat(ref): {ll:+6.1f}°\n"
+        f"  FHP     │ Fwd/Back: {ff:+6.1f}°  Lat(ref): {fl:+6.1f}°\n"
         f"  Relative│ Head vs Lumbar: {rf:+6.1f}°{tag}"
     )
 
@@ -473,7 +687,7 @@ def get_human_indices(points, ransac_iters=300, remove_seat=True):
 def roi_control_panel(shared_bounds):
     root = tk.Tk()
     root.title("ROI & Background Panel")
-    root.geometry("360x860")   # taller to fit the Option C readout
+    root.geometry("360x860")
     root.attributes('-topmost', True)
     root.configure(padx=15, pady=15)
 
@@ -541,17 +755,17 @@ def roi_control_panel(shared_bounds):
     inc_frame.pack(fill="x", pady=5)
 
     # Header row labels
-    tk.Label(inc_frame, text="Segment         Fwd/Back    Lat",
+    tk.Label(inc_frame, text="Segment         Fwd/Back    Lat (ref only)",
              font=('Courier', 8), fg="gray", anchor='w').pack(fill='x')
     tk.Frame(inc_frame, height=1, bg="lightgray").pack(fill='x', pady=2)
 
-    # ● Lumbar row  (bot → thoracic anchor)
+    # Lumbar row  (bot → thoracic anchor)
     lbl_lumbar = tk.Label(inc_frame,
                           text="● Lumbar (bot→mid)    —       —",
                           font=('Courier', 10), fg="black", anchor='w')
     lbl_lumbar.pack(fill='x')
 
-    # ● FHP row  (thoracic anchor → head)
+    # FHP row  (thoracic anchor → head)
     lbl_fhp    = tk.Label(inc_frame,
                           text="● FHP    (mid→top)    —       —",
                           font=('Courier', 10), fg="black", anchor='w')
@@ -569,10 +783,21 @@ def roi_control_panel(shared_bounds):
                            font=('Arial', 10, 'bold'), fg="red")
     lbl_alert.pack(pady=(4, 0))
 
+    # Lateral reference note
+    tk.Label(inc_frame,
+             text="⚠ Lat values are reference only — not used in alerts\n"
+                  "   (LiDAR lateral accuracy insufficient for L/R assessment)",
+             font=('Arial', 7), fg="#b08000", anchor='w', justify='left').pack(fill='x', pady=(4, 0))
+
+    # Smoothing info banner
+    tk.Label(inc_frame,
+             text=f"Smoothing: {SMOOTH_WINDOW}-frame avg  |  z>{SMOOTH_Z_THRESH}σ cut  |  clip ±{SMOOTH_HARD_CLIP:.0f}°",
+             font=('Arial', 7), fg="gray", anchor='w').pack(fill='x', pady=(3, 0))
+
     # Legend
     tk.Label(inc_frame,
              text="● orange=thoracic anchor  ● red=pelvis  ● green=head",
-             font=('Arial', 7), fg="gray", anchor='w').pack(fill='x', pady=(4, 0))
+             font=('Arial', 7), fg="gray", anchor='w').pack(fill='x', pady=(2, 0))
 
     def update_shared_dict():
         nonlocal last_saved_values
@@ -607,17 +832,19 @@ def roi_control_panel(shared_bounds):
         inc = shared_bounds.get('inclination')
         if inc:
             lf = inc.get("lumbar_fwd_deg", 0.0)
-            ll = inc.get("lumbar_lat_deg", 0.0)
+            ll = inc.get("lumbar_lat_deg", 0.0)   # reference only
             ff = inc.get("fhp_fwd_deg",    0.0)
-            fl = inc.get("fhp_lat_deg",    0.0)
+            fl = inc.get("fhp_lat_deg",    0.0)   # reference only
             rf = inc.get("relative_fhp_deg", 0.0)
 
-            lumbar_bad = abs(lf) > LUMBAR_ALERT_DEG or abs(ll) > LUMBAR_ALERT_DEG
+            # Forward-plane only — lateral excluded from alert logic
+            lumbar_bad = abs(lf) > LUMBAR_ALERT_DEG
             fhp_bad    = abs(rf) > FHP_RELATIVE_ALERT
 
+            # Lateral shown in muted grey to reinforce "reference only" status
             lbl_lumbar.config(
                 text=f"● Lumbar (bot→mid)  {lf:+6.1f}°  {ll:+6.1f}°",
-                fg="red" if lumbar_bad else "#b35a00")   # orange-brown when OK
+                fg="red" if lumbar_bad else "#b35a00")
 
             lbl_fhp.config(
                 text=f"● FHP    (mid→top)  {ff:+6.1f}°  {fl:+6.1f}°",
@@ -628,7 +855,6 @@ def roi_control_panel(shared_bounds):
                 text=f"▲ Relative FHP:  {rf:+6.1f}°",
                 fg=rel_color)
 
-            # Alert banner
             if fhp_bad and lumbar_bad:
                 lbl_alert.config(text="⚠ Lumbar + Forward-Head detected!", fg="red")
             elif fhp_bad:
@@ -677,9 +903,9 @@ def cmd_handshake(host_ip, dp, cp, ip):
     return build_cmd(0x00, 0x01,
                      socket.inet_aton(host_ip) + struct.pack('<HHH', dp, cp, ip),
                      cmd_type=0x01)
-def cmd_heartbeat():          return build_cmd(0x00, 0x03)
-def cmd_start_sampling(s=True): return build_cmd(0x00, 0x04, bytes([0x01 if s else 0x00]))
-def cmd_set_cartesian():      return build_cmd(0x00, 0x05, bytes([0x00]))
+def cmd_heartbeat():              return build_cmd(0x00, 0x03)
+def cmd_start_sampling(s=True):   return build_cmd(0x00, 0x04, bytes([0x01 if s else 0x00]))
+def cmd_set_cartesian():          return build_cmd(0x00, 0x05, bytes([0x00]))
 
 _DATA_HDR = 18
 def parse_data_packet(data):
@@ -734,8 +960,11 @@ def get_box_lineset(min_b, max_b):
 
 def live_livox_viewer(shared_bounds, initial_camera=None):
     print("  Livox Avia – Posture Viewer (Option C: Three-Segment Spine)\n")
-    print(f"  Lumbar alert:  ±{LUMBAR_ALERT_DEG}°")
-    print(f"  FHP relative alert: >{FHP_RELATIVE_ALERT}°\n")
+    print(f"  Lumbar alert:       ±{LUMBAR_ALERT_DEG}°")
+    print(f"  FHP relative alert: >{FHP_RELATIVE_ALERT}°")
+    print(f"  Spatial NMS:        lat_thresh={NMS_LAT_THRESH} m, {NMS_ITERATIONS} passes")
+    print(f"  Temporal smoother:  {SMOOTH_WINDOW}-frame window, "
+          f"z>{SMOOTH_Z_THRESH}σ cut, hard clip ±{SMOOTH_HARD_CLIP}°\n")
 
     bcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     bcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -833,6 +1062,15 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
     active_spine_geom   = None
     active_outline_geom = None
 
+    # ── Temporal smoother — one instance persists across frames ───────────────
+    smoother = TemporalSmoother(
+        window=SMOOTH_WINDOW,
+        z_thresh=SMOOTH_Z_THRESH,
+        hard_clip=SMOOTH_HARD_CLIP,
+    )
+    # Track whether a person was visible last frame so we can reset on disappear
+    person_was_visible = False
+
     try:
         while True:
             # ── Drain UDP buffer ───────────────────────────────────────────────
@@ -916,6 +1154,7 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
 
                     if chair_state == 'active' and len(arr) > 20:
                         human_mask = get_human_indices(arr, ransac_iters=50)
+
                         if human_mask is not None:
                             arr_h   = arr[human_mask]
                             dists_h = dists[human_mask]
@@ -936,15 +1175,30 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
                             else:
                                 arr, dists = arr_h, dists_h
 
-                            # Option C spine + outline
+                            # ── Spine + outline (spatial NMS applied inside) ───
                             active_spine_geom, active_outline_geom, inclination = \
                                 extract_spine_and_outline(arr)
 
                             if inclination is not None:
+                                # ── Temporal smoothing (5-frame avg + outlier cut)
+                                inclination = smoother.update(inclination)
                                 shared_bounds['inclination'] = inclination
                                 print_inclination(inclination)
+                                person_was_visible = True
                             else:
+                                # Person disappeared — reset buffer so stale history
+                                # doesn't pollute the next sit-down session
+                                if person_was_visible:
+                                    smoother.reset()
+                                    person_was_visible = False
                                 shared_bounds['inclination'] = None
+
+                        else:
+                            # No human detected this frame
+                            if person_was_visible:
+                                smoother.reset()
+                                person_was_visible = False
+                            shared_bounds['inclination'] = None
 
                     if active_spine_geom is not None:
                         vis.add_geometry(active_spine_geom,   reset_bounding_box=False)
