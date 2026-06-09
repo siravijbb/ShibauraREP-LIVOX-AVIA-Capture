@@ -36,6 +36,37 @@ Option C — Three-Segment Angle Model
        excluded before averaging (z-score outlier rejection).
        Hard clip of ±60° discards physically impossible readings
        before they even enter the buffer.
+
+CHANGES vs original
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  FIX 1 – Window-close detection
+    vis.poll_events() now breaks the loop when it returns False
+    (i.e. the user closed the 3-D window).  Previously the loop
+    kept running forever after the window was dismissed.
+
+  FIX 2 – Heavy processing moved off the main thread
+    get_human_indices (RANSAC + plane-RANSAC),
+    cluster_dbscan, and extract_spine_and_outline (CV2 + 100s of
+    Open3D mesh calls) now run inside _heavy_worker(), a daemon
+    thread.  The main thread only does:
+      • drain UDP packets
+      • fast ROI filter + background subtraction
+      • non-blocking job submit / result pickup
+      • geometry swap + vis.poll_events() every 1 ms
+    This prevents the 3-D window from freezing during heavy frames.
+
+  Implementation notes
+    • A single-slot job queue (_job_q, maxsize=1): if a new frame
+      arrives before the worker finishes the previous one, the stale
+      job is replaced so processing never falls more than one frame
+      behind.
+    • A single-slot result queue (_result_q, maxsize=1): same policy
+      — stale results are replaced by fresh ones.
+    • Temporal smoothing (TemporalSmoother.update) stays on the main
+      thread so frame ordering is always preserved.
+    • Open3D geometry objects (TriangleMesh etc.) are created on the
+      worker thread and added/removed from the visualiser on the main
+      thread — this is safe per Open3D's threading model.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -44,6 +75,7 @@ os.environ['GLOG_minloglevel'] = '3'
 os.environ['GRPC_VERBOSITY']   = 'NONE'
 
 import collections
+import queue
 import socket
 import struct
 import threading
@@ -78,26 +110,17 @@ BG_PCD_FILE = "background_model.pcd"
 SPINE_SLICES = 100
 
 # ── Option C alert thresholds ──────────────────────────────────────────────────
-# Forward-plane angles only.
-# Lateral (left/right) angles are computed and stored for reference but are
-# intentionally excluded from all alert logic — LiDAR angular resolution and
-# depth-based estimation make lateral measurements too unreliable for seated
-# posture assessment.  If a future sensor/mount improves lateral accuracy,
-# add `abs(ll) > LUMBAR_ALERT_DEG` back into the lumbar_alert expressions.
 LUMBAR_ALERT_DEG   = 15.0
-# Upper-segment RELATIVE forward-head angle vs lumbar baseline
-# 12° = early tech-neck; tune downward (e.g. 8°) for stricter monitoring
 FHP_RELATIVE_ALERT = 12.0
 
 # ── Spatial NMS ────────────────────────────────────────────────────────────────
-# Max lateral deviation (m) a centroid slice may have from its neighbours
 NMS_LAT_THRESH  = 0.12
-NMS_ITERATIONS  = 2      # passes; extra passes clean up chains of bad points
+NMS_ITERATIONS  = 2
 
 # ── Temporal smoother ──────────────────────────────────────────────────────────
-SMOOTH_WINDOW    = 5     # frames kept in rolling buffer
-SMOOTH_Z_THRESH  = 1.5   # σ — frames beyond this are excluded from average
-SMOOTH_HARD_CLIP = 60.0  # °  — readings outside ±clip never enter buffer
+SMOOTH_WINDOW    = 5
+SMOOTH_Z_THRESH  = 1.5
+SMOOTH_HARD_CLIP = 60.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -144,28 +167,6 @@ def create_line_cylinders(pts_3d, lines_idx, color, radius=0.018):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def nms_spine_centroids(spine_pts, lat_thresh=NMS_LAT_THRESH, iterations=NMS_ITERATIONS):
-    """
-    Spatial NMS on the spine centroid list.
-
-    Each interior centroid is compared against its immediate neighbours.
-    If the lateral (XY-plane) deviation from the linear interpolation
-    between those neighbours exceeds `lat_thresh` metres, the point is
-    suppressed.  Multiple passes handle chains of consecutive bad points.
-
-    The first and last points are never removed so the lumbar/head
-    anchor zones always have at least one sample.
-
-    Parameters
-    ----------
-    spine_pts   : list of [X, Y, Z] ordered bottom → top
-    lat_thresh  : max allowed XY deviation from neighbour midpoint (m)
-    iterations  : number of suppression passes
-
-    Returns
-    -------
-    Filtered list in the same [X, Y, Z] format.
-    Falls back to the original list if fewer than 4 points survive.
-    """
     pts = spine_pts
     for _ in range(iterations):
         if len(pts) < 3:
@@ -173,7 +174,6 @@ def nms_spine_centroids(spine_pts, lat_thresh=NMS_LAT_THRESH, iterations=NMS_ITE
         arr  = np.array(pts, dtype=float)
         keep = np.ones(len(arr), dtype=bool)
         for i in range(1, len(arr) - 1):
-            # Expected XY = linear interpolation of immediate neighbours
             expected_xy = (arr[i - 1, :2] + arr[i + 1, :2]) * 0.5
             dev = np.linalg.norm(arr[i, :2] - expected_xy)
             if dev > lat_thresh:
@@ -181,7 +181,6 @@ def nms_spine_centroids(spine_pts, lat_thresh=NMS_LAT_THRESH, iterations=NMS_ITE
         filtered = arr[keep].tolist()
         if len(filtered) >= 4:
             pts = filtered
-        # If too many points removed this pass, stop early
         else:
             break
     return pts
@@ -192,30 +191,6 @@ def nms_spine_centroids(spine_pts, lat_thresh=NMS_LAT_THRESH, iterations=NMS_ITE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TemporalSmoother:
-    """
-    Rolling N-frame buffer for inclination angles with z-score outlier rejection.
-
-    Each frame's angles are added to per-metric circular buffers.  When a
-    smoothed value is requested, frames whose value lies more than
-    `z_thresh` standard deviations from the buffer mean are excluded
-    before the average is taken.
-
-    This removes single-frame spikes (chair creak, sensor glitch, partial
-    occlusion) without adding noticeable lag for genuine posture changes.
-
-    A `hard_clip` gate discards physically impossible readings before they
-    even enter the buffer (e.g. a 90° spike from a spurious point cluster).
-
-    Usage
-    -----
-        smoother = TemporalSmoother()
-        smoothed_inc = smoother.update(raw_inc_dict)
-
-    `relative_fhp_deg` is re-derived from the smoothed fhp/lumbar values
-    rather than smoothed independently, so all three displayed numbers
-    stay self-consistent.
-    """
-
     ANGLE_KEYS = (
         "lumbar_fwd_deg",
         "lumbar_lat_deg",
@@ -226,17 +201,10 @@ class TemporalSmoother:
 
     def __init__(
         self,
-        window: int   = SMOOTH_WINDOW,
+        window: int    = SMOOTH_WINDOW,
         z_thresh: float = SMOOTH_Z_THRESH,
         hard_clip: float = SMOOTH_HARD_CLIP,
     ):
-        """
-        Parameters
-        ----------
-        window    : number of recent frames to keep (rolling)
-        z_thresh  : frames beyond this many σ from the buffer mean are excluded
-        hard_clip : readings outside ±hard_clip degrees never enter the buffer
-        """
         self.window    = window
         self.z_thresh  = z_thresh
         self.hard_clip = hard_clip
@@ -244,44 +212,23 @@ class TemporalSmoother:
             k: collections.deque(maxlen=window) for k in self.ANGLE_KEYS
         }
 
-    # ── public ────────────────────────────────────────────────────────────────
-
     def update(self, inc: dict) -> dict:
-        """
-        Push a new raw inclination dict and return a smoothed copy.
-
-        Non-angle keys (bot_pt / mid_pt / top_pt) pass through unchanged
-        so the 3-D landmarks always reflect the current frame position.
-        """
-        result = dict(inc)  # preserve landmark positions as-is
-
-        # Smooth fwd/lat angles independently
+        result = dict(inc)
         for k in ("lumbar_fwd_deg", "lumbar_lat_deg", "fhp_fwd_deg", "fhp_lat_deg"):
             raw = float(inc.get(k, 0.0))
-            if abs(raw) <= self.hard_clip:          # hard gate
+            if abs(raw) <= self.hard_clip:
                 self._bufs[k].append(raw)
             result[k] = round(self._robust_mean(self._bufs[k]), 2)
-
-        # Re-derive relative FHP from the already-smoothed components so the
-        # three displayed numbers are always self-consistent (not independently
-        # smoothed versions of each other).
         result["relative_fhp_deg"] = round(
             result["fhp_fwd_deg"] - result["lumbar_fwd_deg"], 2)
-
-        # Keep the derived buffer in sync for alert logic, but don't feed raw
         self._bufs["relative_fhp_deg"].append(result["relative_fhp_deg"])
-
         return result
 
     def reset(self):
-        """Clear all buffers (call when the person leaves the frame)."""
         for buf in self._bufs.values():
             buf.clear()
 
-    # ── private ───────────────────────────────────────────────────────────────
-
     def _robust_mean(self, buf: collections.deque) -> float:
-        """Mean of buffer values after removing z-score outliers."""
         if len(buf) == 0:
             return 0.0
         arr  = np.array(buf, dtype=float)
@@ -289,11 +236,10 @@ class TemporalSmoother:
         if len(arr) == 1:
             return mean
         std = float(np.std(arr))
-        if std < 1e-6:          # all values identical → no outlier logic needed
+        if std < 1e-6:
             return mean
         mask = np.abs(arr - mean) <= self.z_thresh * std
         kept = arr[mask]
-        # Fallback: if the filter removes everything, use the unfiltered mean
         return float(np.mean(kept)) if len(kept) > 0 else mean
 
 
@@ -302,37 +248,15 @@ class TemporalSmoother:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def three_segment_inclination(spine_pts):
-    """
-    Split the spine centroid list into three anatomical zones and compute
-    independent angles for each segment.
-
-    Parameters
-    ----------
-    spine_pts : list of [X, Y, Z] centroids, ordered bottom → top
-
-    Returns
-    -------
-    dict with keys:
-        lumbar_fwd_deg   – forward/back lean, lower segment (bot→mid)
-        lumbar_lat_deg   – left/right lean,   lower segment
-        fhp_fwd_deg      – forward/back lean, upper segment (mid→top)
-        fhp_lat_deg      – left/right lean,   upper segment
-        relative_fhp_deg – fhp_fwd − lumbar_fwd  (key bad-office metric)
-        bot_pt / mid_pt / top_pt  – the three landmark positions
-    """
     pts   = np.array(spine_pts, dtype=float)
     n     = len(pts)
+    n_end  = max(1, n // 4)
+    n_mid0 = n // 2
+    n_mid1 = 3 * n // 4
+    bot = np.mean(pts[:n_end],         axis=0)
+    mid = np.mean(pts[n_mid0:n_mid1], axis=0)
+    top = np.mean(pts[n - n_end:],     axis=0)
 
-    # Landmark averaging windows
-    n_end  = max(1, n // 4)        # outer 25% for bot & top
-    n_mid0 = n // 2                # start at 50% of height
-    n_mid1 = 3 * n // 4           # end at 75% of height
-
-    bot = np.mean(pts[:n_end],          axis=0)   # pelvis / lumbar base
-    mid = np.mean(pts[n_mid0:n_mid1],  axis=0)
-    top = np.mean(pts[n - n_end:],      axis=0)   # head / cervical
-
-    # ── Lower segment: pelvis → thoracic ──────────────────────────────────────
     dZ_lower = float(mid[2] - bot[2])
     if abs(dZ_lower) > 0.03:
         lumbar_fwd_deg = float(np.degrees(np.arctan2(mid[1] - bot[1], dZ_lower)))
@@ -340,7 +264,6 @@ def three_segment_inclination(spine_pts):
     else:
         lumbar_fwd_deg = lumbar_lat_deg = 0.0
 
-    # ── Upper segment: thoracic → head ────────────────────────────────────────
     dZ_upper = float(top[2] - mid[2])
     if abs(dZ_upper) > 0.03:
         fhp_fwd_deg = float(np.degrees(np.arctan2(top[1] - mid[1], dZ_upper)))
@@ -348,8 +271,6 @@ def three_segment_inclination(spine_pts):
     else:
         fhp_fwd_deg = fhp_lat_deg = 0.0
 
-    # ── Relative angle — the primary bad-office-syndrome indicator ─────────────
-    # Positive = head leans further forward than the lumbar baseline
     relative_fhp_deg = fhp_fwd_deg - lumbar_fwd_deg
 
     return {
@@ -369,40 +290,11 @@ def three_segment_inclination(spine_pts):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def extract_spine_and_outline(points):
-    """
-    Projection: fixed X-axis view → project onto the YZ plane
-                (Y = horizontal, Z = vertical).
-
-    Pipeline
-    --------
-    1. Slice the body into SPINE_SLICES horizontal bands.
-    2. Compute per-band centroid → raw spine_pts list.
-    3. Spatial NMS pass (nms_spine_centroids) to remove lateral outliers.
-    4. Rebuild spine lines from the cleaned list.
-    5. Compute three-segment inclination on cleaned spine.
-
-    Outputs
-    -------
-    spine_mesh   : cylinder segments + sphere knots tracing each horizontal
-                   slice centroid.  Colour gradient cyan (bottom) → yellow (top).
-                   Two directional arrows:
-                     • Orange  bot → mid   (lumbar segment)
-                     • Lime    mid → top   (FHP / cervical segment)
-                   Three reference spheres:
-                     • Red    = pelvis (bot)
-                     • Orange = thoracic anchor (mid)
-                     • Green  = head/neck (top)
-    outline_mesh : magenta body-contour cylinder ring.
-    inclination  : Option C dict from three_segment_inclination(), or None.
-                   NOTE: these are raw per-frame values; caller applies
-                   TemporalSmoother before storing / displaying.
-    """
     if len(points) < 40:
         return None, None, None
 
-    # ── Project onto YZ plane (look from X axis) ──────────────────────────────
-    horiz = points[:, 1]   # Y → horizontal
-    vert  = points[:, 2]   # Z → vertical
+    horiz = points[:, 1]
+    vert  = points[:, 2]
 
     H, W = 512, 512
     h_min, h_max = np.min(horiz), np.max(horiz)
@@ -423,15 +315,13 @@ def extract_spine_and_outline(points):
         p2d[(u_px[idx], v_px[idx])] = idx
         img[v_px[idx], u_px[idx]] = 255
 
-    # ── Silhouette ────────────────────────────────────────────────────────────
     kd  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
     kc  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
     sil = cv2.morphologyEx(cv2.dilate(img, kd), cv2.MORPH_CLOSE, kc)
 
-    # ── Outline ───────────────────────────────────────────────────────────────
     outline_mesh = None
     contours, _  = cv2.findContours(sil, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    avg_x        = float(np.mean(points[:, 0]))   # fallback depth along X axis
+    avg_x        = float(np.mean(points[:, 0]))
 
     if contours:
         largest       = max(contours, key=cv2.contourArea)
@@ -472,12 +362,10 @@ def extract_spine_and_outline(points):
             outline_mesh = create_line_cylinders(
                 outline_pts, outline_lines, [1.0, 0.0, 1.0], radius=0.012)
 
-    # ── Spine: centroid per height band ───────────────────────────────────────
     z_vals          = points[:, 2]
     z_min, z_max    = float(np.min(z_vals)), float(np.max(z_vals))
     z_range         = z_max - z_min
 
-    # Trim bottom 10% (chair base / floor noise) and top 5% (hair reflections)
     z_lo    = z_min + z_range * 0.10
     z_hi    = z_max - z_range * 0.05
     body    = points[(z_vals >= z_lo) & (z_vals <= z_hi)]
@@ -503,66 +391,51 @@ def extract_spine_and_outline(points):
     inclination = None
 
     if len(spine_pts) >= 4:
-
-        # ── Spatial NMS: suppress per-slice lateral outliers ──────────────────
-        spine_pts = nms_spine_centroids(
+        spine_pts   = nms_spine_centroids(
             spine_pts, lat_thresh=NMS_LAT_THRESH, iterations=NMS_ITERATIONS)
-
-        # Rebuild line index list from the cleaned (possibly shorter) point list
         spine_lines = [[i, i + 1] for i in range(len(spine_pts) - 1)]
 
         if len(spine_pts) < 4:
             return None, outline_mesh, None
 
-        # ── Build mesh ────────────────────────────────────────────────────────
         combined = o3d.geometry.TriangleMesh()
 
-        # White cylinder bones
         cyl = create_line_cylinders(
             spine_pts, spine_lines, [1.0, 1.0, 1.0], radius=0.022)
         if cyl is not None:
             combined += cyl
 
-        # Coloured sphere knots — cyan (bottom) → yellow (top)
         n_pts = len(spine_pts)
         for j, pt in enumerate(spine_pts):
-            t     = j / max(n_pts - 1, 1)      # 0.0 at bottom, 1.0 at top
-            color = [t, 1.0, 1.0 - t]          # cyan → yellow
+            t     = j / max(n_pts - 1, 1)
+            color = [t, 1.0, 1.0 - t]
             sph   = o3d.geometry.TriangleMesh.create_sphere(radius=0.035, resolution=8)
             sph.translate(np.array(pt, dtype=float))
             sph.paint_uniform_color(color)
             sph.compute_vertex_normals()
             combined += sph
 
-        # ── Option C: three-segment inclination ───────────────────────────────
         inclination = three_segment_inclination(spine_pts)
         bot = np.array(inclination["bot_pt"])
         mid = np.array(inclination["mid_pt"])
         top = np.array(inclination["top_pt"])
 
-        # Arrow 1: Orange  bot → mid  (lumbar segment)
         arrow_lumbar = create_line_cylinders(
-            [bot.tolist(), mid.tolist()],
-            [[0, 1]],
-            color=[1.0, 0.55, 0.0],   # orange
-            radius=0.030)
+            [bot.tolist(), mid.tolist()], [[0, 1]],
+            color=[1.0, 0.55, 0.0], radius=0.030)
         if arrow_lumbar is not None:
             combined += arrow_lumbar
 
-        # Arrow 2: Lime  mid → top  (FHP / cervical segment)
         arrow_fhp = create_line_cylinders(
-            [mid.tolist(), top.tolist()],
-            [[0, 1]],
-            color=[0.4, 1.0, 0.0],    # lime green
-            radius=0.030)
+            [mid.tolist(), top.tolist()], [[0, 1]],
+            color=[0.4, 1.0, 0.0], radius=0.030)
         if arrow_fhp is not None:
             combined += arrow_fhp
 
-        # Reference spheres: red=pelvis, orange=thoracic, green=head
         for pt, col, rad in [
-            (bot, [1.0, 0.2, 0.2],  0.045),   # red    — pelvis
-            (mid, [1.0, 0.55, 0.0], 0.050),   # orange — thoracic anchor
-            (top, [0.2, 1.0, 0.2],  0.045),   # green  — head/neck
+            (bot, [1.0, 0.2, 0.2],  0.045),
+            (mid, [1.0, 0.55, 0.0], 0.050),
+            (top, [0.2, 1.0, 0.2],  0.045),
         ]:
             mk = o3d.geometry.TriangleMesh.create_sphere(radius=rad, resolution=8)
             mk.translate(np.array(pt, dtype=float))
@@ -582,24 +455,14 @@ def extract_spine_and_outline(points):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def print_inclination(inc):
-    """
-    Pretty-print Option C inclination dict to stdout.
-
-    Alert logic uses forward-plane angles only.
-    Lateral (left/right) values are printed for reference but are NOT
-    used for any alert decision — LiDAR lateral accuracy is insufficient
-    for reliable left/right posture assessment.
-    """
     if inc is None:
         return
-
     lf = inc["lumbar_fwd_deg"]
-    ll = inc["lumbar_lat_deg"]   # reference only — not used in alerts
+    ll = inc["lumbar_lat_deg"]
     ff = inc["fhp_fwd_deg"]
-    fl = inc["fhp_lat_deg"]      # reference only — not used in alerts
+    fl = inc["fhp_lat_deg"]
     rf = inc["relative_fhp_deg"]
 
-    # Forward-plane only
     lumbar_alert = abs(lf) > LUMBAR_ALERT_DEG
     fhp_alert    = abs(rf) > FHP_RELATIVE_ALERT
 
@@ -708,7 +571,6 @@ def roi_control_panel(shared_bounds):
 
     tk.Frame(root, height=2, bd=1, relief="sunken").pack(fill="x", pady=10)
 
-    # ── Background calibration ────────────────────────────────────────────────
     bg_frame  = tk.LabelFrame(root, text=" 1. Background (Floor/Walls) ",
                                font=('Arial', 10, 'bold'), padx=10, pady=5)
     bg_frame.pack(fill="x", pady=5)
@@ -732,7 +594,6 @@ def roi_control_panel(shared_bounds):
               command=lambda: shared_bounds.update({'bg_state': 'clear'}),
               bg="#ffebee").pack(side="right", fill="x")
 
-    # ── Chair / human filter ──────────────────────────────────────────────────
     chair_frame  = tk.LabelFrame(root, text=" 2. Human Extraction (Chair Filter) ",
                                   font=('Arial', 10, 'bold'), padx=10, pady=5)
     chair_frame.pack(fill="x", pady=5)
@@ -749,23 +610,19 @@ def roi_control_panel(shared_bounds):
                                chair_status.config(text="Inactive", fg="gray")),
               bg="#ffebee").pack(side="right", fill="x")
 
-    # ── Option C — Three-Segment Inclination readout ──────────────────────────
     inc_frame = tk.LabelFrame(root, text=" 3. Three-Segment Inclination (Option C) ",
                                font=('Arial', 10, 'bold'), padx=10, pady=5)
     inc_frame.pack(fill="x", pady=5)
 
-    # Header row labels
     tk.Label(inc_frame, text="Segment         Fwd/Back    Lat (ref only)",
              font=('Courier', 8), fg="gray", anchor='w').pack(fill='x')
     tk.Frame(inc_frame, height=1, bg="lightgray").pack(fill='x', pady=2)
 
-    # Lumbar row  (bot → thoracic anchor)
     lbl_lumbar = tk.Label(inc_frame,
                           text="● Lumbar (bot→mid)    —       —",
                           font=('Courier', 10), fg="black", anchor='w')
     lbl_lumbar.pack(fill='x')
 
-    # FHP row  (thoracic anchor → head)
     lbl_fhp    = tk.Label(inc_frame,
                           text="● FHP    (mid→top)    —       —",
                           font=('Courier', 10), fg="black", anchor='w')
@@ -773,7 +630,6 @@ def roi_control_panel(shared_bounds):
 
     tk.Frame(inc_frame, height=1, bg="lightgray").pack(fill='x', pady=2)
 
-    # Relative angle — the key bad-office metric
     lbl_rel    = tk.Label(inc_frame,
                           text="▲ Relative FHP:   —",
                           font=('Courier', 10, 'bold'), fg="black", anchor='w')
@@ -783,18 +639,15 @@ def roi_control_panel(shared_bounds):
                            font=('Arial', 10, 'bold'), fg="red")
     lbl_alert.pack(pady=(4, 0))
 
-    # Lateral reference note
     tk.Label(inc_frame,
              text="⚠ Lat values are reference only — not used in alerts\n"
                   "   (LiDAR lateral accuracy insufficient for L/R assessment)",
              font=('Arial', 7), fg="#b08000", anchor='w', justify='left').pack(fill='x', pady=(4, 0))
 
-    # Smoothing info banner
     tk.Label(inc_frame,
              text=f"Smoothing: {SMOOTH_WINDOW}-frame avg  |  z>{SMOOTH_Z_THRESH}σ cut  |  clip ±{SMOOTH_HARD_CLIP:.0f}°",
              font=('Arial', 7), fg="gray", anchor='w').pack(fill='x', pady=(3, 0))
 
-    # Legend
     tk.Label(inc_frame,
              text="● orange=thoracic anchor  ● red=pelvis  ● green=head",
              font=('Arial', 7), fg="gray", anchor='w').pack(fill='x', pady=(2, 0))
@@ -819,7 +672,6 @@ def roi_control_panel(shared_bounds):
             except Exception:
                 pass
 
-        # ── Refresh background status ──────────────────────────────────────
         b_st = shared_bounds.get('bg_state', 'idle')
         if b_st == 'active':
             bg_status.config(text="Active (Room Hidden)", fg="green")
@@ -828,32 +680,25 @@ def roi_control_panel(shared_bounds):
         elif b_st == 'scanning':
             bg_status.config(text="Scanning empty room...", fg="blue")
 
-        # ── Refresh Option C inclination readout ──────────────────────────
         inc = shared_bounds.get('inclination')
         if inc:
             lf = inc.get("lumbar_fwd_deg", 0.0)
-            ll = inc.get("lumbar_lat_deg", 0.0)   # reference only
+            ll = inc.get("lumbar_lat_deg", 0.0)
             ff = inc.get("fhp_fwd_deg",    0.0)
-            fl = inc.get("fhp_lat_deg",    0.0)   # reference only
+            fl = inc.get("fhp_lat_deg",    0.0)
             rf = inc.get("relative_fhp_deg", 0.0)
 
-            # Forward-plane only — lateral excluded from alert logic
             lumbar_bad = abs(lf) > LUMBAR_ALERT_DEG
             fhp_bad    = abs(rf) > FHP_RELATIVE_ALERT
 
-            # Lateral shown in muted grey to reinforce "reference only" status
             lbl_lumbar.config(
                 text=f"● Lumbar (bot→mid)  {lf:+6.1f}°  {ll:+6.1f}°",
                 fg="red" if lumbar_bad else "#b35a00")
-
             lbl_fhp.config(
                 text=f"● FHP    (mid→top)  {ff:+6.1f}°  {fl:+6.1f}°",
                 fg="red" if fhp_bad else "dark green")
-
             rel_color = "red" if fhp_bad else ("dark orange" if abs(rf) > 6 else "black")
-            lbl_rel.config(
-                text=f"▲ Relative FHP:  {rf:+6.1f}°",
-                fg=rel_color)
+            lbl_rel.config(text=f"▲ Relative FHP:  {rf:+6.1f}°", fg=rel_color)
 
             if fhp_bad and lumbar_bad:
                 lbl_alert.config(text="⚠ Lumbar + Forward-Head detected!", fg="red")
@@ -966,6 +811,7 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
     print(f"  Temporal smoother:  {SMOOTH_WINDOW}-frame window, "
           f"z>{SMOOTH_Z_THRESH}σ cut, hard clip ±{SMOOTH_HARD_CLIP}°\n")
 
+    # ── Device discovery ───────────────────────────────────────────────────────
     bcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     bcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     bcast_sock.bind(("0.0.0.0", BROADCAST_PORT))
@@ -1015,6 +861,7 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
     data_sock.bind((host_ip, HOST_DATA_PORT))
     data_sock.setblocking(False)
 
+    # ── Open3D setup ───────────────────────────────────────────────────────────
     vis = o3d.visualization.Visualizer()
     vis.create_window("Livox Avia – Posture Viewer (Option C)", 1280, 720)
 
@@ -1041,6 +888,7 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
             os.remove("temp_cam_load.json")
         except: pass
 
+    # ── Background model ───────────────────────────────────────────────────────
     background_pcd = None
     if os.path.exists(BG_PCD_FILE):
         try:
@@ -1062,18 +910,167 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
     active_spine_geom   = None
     active_outline_geom = None
 
-    # ── Temporal smoother — one instance persists across frames ───────────────
-    smoother = TemporalSmoother(
-        window=SMOOTH_WINDOW,
-        z_thresh=SMOOTH_Z_THRESH,
-        hard_clip=SMOOTH_HARD_CLIP,
-    )
-    # Track whether a person was visible last frame so we can reset on disappear
+    smoother           = TemporalSmoother(
+        window=SMOOTH_WINDOW, z_thresh=SMOOTH_Z_THRESH, hard_clip=SMOOTH_HARD_CLIP)
     person_was_visible = False
 
+    # ── FIX 2: Heavy-processing thread ────────────────────────────────────────
+    # All slow operations are offloaded here so vis.poll_events() on the main
+    # thread is never blocked:
+    #   • compute_point_cloud_distance  (background subtraction)
+    #   • get_human_indices             (RANSAC sphere + seat-plane RANSAC)
+    #   • cluster_dbscan                (largest body cluster)
+    #   • extract_spine_and_outline     (CV2 + Open3D mesh build)
+    #
+    # FIX 3: Transition freeze
+    #   compute_point_cloud_distance was still running on the main thread.
+    #   A standing person has 3–5× more points than seated, so the KD-tree
+    #   query could take 1–3 s during posture transitions — freezing the
+    #   window.  It now runs inside _heavy_worker alongside the rest.
+    #
+    # FIX 4: Random subsample cap (MAX_WORKER_PTS)
+    #   Before submitting a job the point cloud is randomly downsampled to at
+    #   most MAX_WORKER_PTS points.  This gives a hard ceiling on worker
+    #   latency regardless of how many points the sensor returns during or
+    #   after a posture change.
+    #
+    # FIX 5: Worker exception recovery
+    #   An unhandled exception in the worker (e.g. a degenerate intermediate
+    #   frame during transition) previously killed the thread silently — the
+    #   3-D window stayed open but updates stopped forever.  Now every frame
+    #   is wrapped in try/except: errors are printed and the worker continues.
+    #
+    # Single-slot queues: stale job/result is replaced so display always
+    # reflects the most recent frame rather than queueing up lag.
+    _MAX_WORKER_PTS = 6000   # hard cap — random subsample if exceeded
+
+    _job_q    = queue.Queue(maxsize=1)
+    _result_q = queue.Queue(maxsize=1)
+
+    def _submit_job(arr, dists, bg_pcd, bg_active):
+        """
+        Optionally subsample to _MAX_WORKER_PTS, then hand off to the worker.
+        Passing background_pcd as a reference is safe: threads share memory,
+        and the main thread only replaces background_pcd during the rare
+        calibration event (it never mutates the existing object in place).
+        """
+        if len(arr) > _MAX_WORKER_PTS:
+            idx   = np.random.choice(len(arr), _MAX_WORKER_PTS, replace=False)
+            arr   = arr[idx]
+            dists = dists[idx]
+        job = dict(arr=arr, dists=dists, bg_pcd=bg_pcd, bg_active=bg_active)
+        try:
+            _job_q.put_nowait(job)
+        except queue.Full:
+            try:   _job_q.get_nowait()
+            except queue.Empty: pass
+            _job_q.put_nowait(job)
+
+    def _heavy_worker():
+        """
+        Background thread.  Picks up pre-ROI-filtered point arrays and runs:
+          1. Background subtraction   – compute_point_cloud_distance
+          2. get_human_indices        – RANSAC sphere + seat-plane RANSAC
+          3. cluster_dbscan           – largest connected body cluster
+          4. extract_spine_and_outline – CV2 silhouette + Open3D mesh build
+
+        Returns a result dict to _result_q.  Temporal smoothing stays on the
+        main thread so frame ordering is always preserved.
+
+        The entire frame body is wrapped in try/except so one bad frame
+        (e.g. a degenerate intermediate shape during a sit/stand transition)
+        is printed and skipped rather than killing the thread permanently.
+        """
+        while not stop_event.is_set():
+            try:
+                job = _job_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            arr_in   = job['arr']
+            dists_in = job['dists']
+
+            # Safe defaults — returned if anything fails
+            display_arr   = arr_in
+            display_dists = dists_in
+            spine_mesh    = None
+            outline_mesh  = None
+            raw_inc       = None
+            person_vis    = False
+
+            try:
+                # ── 1. Background subtraction (moved from main thread) ─────────
+                # This was the primary source of transition freezes: a standing
+                # person can produce 3–5× more foreground points than seated,
+                # making the KD-tree query take 1–3 s on the main thread.
+                if job['bg_active'] and job['bg_pcd'] is not None and len(arr_in) > 0:
+                    tmp  = o3d.geometry.PointCloud()
+                    tmp.points = o3d.utility.Vector3dVector(arr_in)
+                    d2bg     = np.asarray(
+                        tmp.compute_point_cloud_distance(job['bg_pcd']))
+                    keep     = d2bg > 0.06
+                    arr_in   = arr_in[keep]
+                    dists_in = dists_in[keep]
+                    display_arr   = arr_in
+                    display_dists = dists_in
+
+                # ── 2–4. Human extraction + spine overlay ──────────────────────
+                if len(arr_in) > 20:
+                    human_mask = get_human_indices(arr_in, ransac_iters=50)
+                    if human_mask is not None:
+                        ah, dh = arr_in[human_mask], dists_in[human_mask]
+
+                        if len(ah) > 20:
+                            _tmp = o3d.geometry.PointCloud()
+                            _tmp.points = o3d.utility.Vector3dVector(ah)
+                            labels = np.array(_tmp.cluster_dbscan(
+                                eps=0.12, min_points=8, print_progress=False))
+                            valid = labels >= 0
+                            if valid.any():
+                                biggest       = np.bincount(labels[valid]).argmax()
+                                display_arr   = ah[labels == biggest]
+                                display_dists = dh[labels == biggest]
+                            else:
+                                display_arr, display_dists = ah, dh
+                        else:
+                            display_arr, display_dists = ah, dh
+
+                        spine_mesh, outline_mesh, raw_inc = \
+                            extract_spine_and_outline(display_arr)
+                        person_vis = raw_inc is not None
+
+            except Exception as exc:
+                # Bad frame (e.g. degenerate intermediate shape during
+                # sit/stand transition) — log and continue; worker keeps running.
+                print(f"  [Worker] frame skipped ({type(exc).__name__}: {exc})")
+                display_arr   = arr_in
+                display_dists = dists_in
+                spine_mesh = outline_mesh = raw_inc = None
+                person_vis = False
+
+            res = dict(
+                display_arr   = display_arr,
+                display_dists = display_dists,
+                spine_mesh    = spine_mesh,
+                outline_mesh  = outline_mesh,
+                raw_inc       = raw_inc,
+                person_vis    = person_vis,
+            )
+
+            # Replace stale result atomically
+            try:
+                _result_q.put_nowait(res)
+            except queue.Full:
+                try:   _result_q.get_nowait()
+                except queue.Empty: pass
+                _result_q.put_nowait(res)
+
+    threading.Thread(target=_heavy_worker, daemon=True, name="HeavyWorker").start()
+
+    # ── Main loop ──────────────────────────────────────────────────────────────
     try:
         while True:
-            # ── Drain UDP buffer ───────────────────────────────────────────────
+            # ── 1. Drain UDP buffer (always fast) ─────────────────────────────
             while True:
                 try:
                     pkt, _ = data_sock.recvfrom(1500)
@@ -1081,8 +1078,10 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
                 except (BlockingIOError, OSError):
                     break
 
-            current_time = time.time()
-            if current_time - last_render_time >= FRAME_TIME_S:
+            now = time.time()
+
+            # ── 2. Every FRAME_TIME_S: fast pre-processing ────────────────────
+            if now - last_render_time >= FRAME_TIME_S:
                 min_b = [min(shared_bounds['X1'], shared_bounds['X2']),
                          min(shared_bounds['Y1'], shared_bounds['Y2']),
                          min(shared_bounds['Z1'], shared_bounds['Z2'])]
@@ -1093,18 +1092,11 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
                 roi_box_vis.points = get_box_lineset(min_b, max_b).points
                 vis.update_geometry(roi_box_vis)
 
-                # Remove previous frame overlays
-                if active_spine_geom is not None:
-                    vis.remove_geometry(active_spine_geom, reset_bounding_box=False)
-                    active_spine_geom = None
-                if active_outline_geom is not None:
-                    vis.remove_geometry(active_outline_geom, reset_bounding_box=False)
-                    active_outline_geom = None
-
                 if accumulated_pts:
                     arr   = np.asarray(accumulated_pts, dtype=np.float64)
                     dists = np.linalg.norm(arr, axis=1)
 
+                    # ROI filter
                     roi_mask = (
                         (dists > 0.01) &
                         (arr[:, 0] >= min_b[0]) & (arr[:, 0] <= max_b[0]) &
@@ -1113,7 +1105,7 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
                     arr   = arr[roi_mask]
                     dists = dists[roi_mask]
 
-                    # ── Background cancellation ────────────────────────────────
+                    # ── Background management (fast — array ops only) ──────────
                     bg_state = shared_bounds.get('bg_state', 'idle')
                     if bg_state == 'clear':
                         background_pcd = None;  bg_accumulating = False
@@ -1122,8 +1114,9 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
                             except Exception: pass
                         shared_bounds['bg_state'] = 'idle'
                     elif bg_state == 'capture':
-                        bg_accumulating = True;  bg_accumulated_pts = []
-                        bg_start_time   = time.time()
+                        bg_accumulating    = True
+                        bg_accumulated_pts = []
+                        bg_start_time      = time.time()
                         shared_bounds['bg_state'] = 'scanning'
 
                     if bg_accumulating:
@@ -1141,95 +1134,125 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
                             else:
                                 shared_bounds['bg_state'] = 'idle'
 
-                    if (shared_bounds.get('bg_state') == 'active'
-                            and background_pcd is not None and len(arr) > 0):
-                        tmp = o3d.geometry.PointCloud()
-                        tmp.points = o3d.utility.Vector3dVector(arr)
-                        d2bg  = np.asarray(tmp.compute_point_cloud_distance(background_pcd))
-                        arr   = arr[d2bg > 0.06]
-                        dists = dists[d2bg > 0.06]
+                    # Background subtraction has moved into _heavy_worker so it
+                    # never blocks vis.poll_events().  Compute the flag here so
+                    # the worker knows whether to apply it.
+                    bg_active = (
+                        shared_bounds.get('bg_state') == 'active'
+                        and background_pcd is not None)
 
-                    # ── Human extraction + posture overlays ────────────────────
+                    # ── Route: worker (chair filter on) or direct update ───────
                     chair_state = shared_bounds.get('chair_state', 'idle')
 
                     if chair_state == 'active' and len(arr) > 20:
-                        human_mask = get_human_indices(arr, ransac_iters=50)
-
-                        if human_mask is not None:
-                            arr_h   = arr[human_mask]
-                            dists_h = dists[human_mask]
-
-                            if len(arr_h) > 20:
-                                _tmp = o3d.geometry.PointCloud()
-                                _tmp.points = o3d.utility.Vector3dVector(arr_h)
-                                _labels = np.array(_tmp.cluster_dbscan(
-                                    eps=0.12, min_points=8, print_progress=False))
-                                _valid = _labels >= 0
-                                if _valid.any():
-                                    _biggest = np.bincount(_labels[_valid]).argmax()
-                                    _body    = _labels == _biggest
-                                    arr   = arr_h[_body]
-                                    dists = dists_h[_body]
-                                else:
-                                    arr, dists = arr_h, dists_h
-                            else:
-                                arr, dists = arr_h, dists_h
-
-                            # ── Spine + outline (spatial NMS applied inside) ───
-                            active_spine_geom, active_outline_geom, inclination = \
-                                extract_spine_and_outline(arr)
-
-                            if inclination is not None:
-                                # ── Temporal smoothing (5-frame avg + outlier cut)
-                                inclination = smoother.update(inclination)
-                                shared_bounds['inclination'] = inclination
-                                print_inclination(inclination)
-                                person_was_visible = True
-                            else:
-                                # Person disappeared — reset buffer so stale history
-                                # doesn't pollute the next sit-down session
-                                if person_was_visible:
-                                    smoother.reset()
-                                    person_was_visible = False
-                                shared_bounds['inclination'] = None
-
-                        else:
-                            # No human detected this frame
-                            if person_was_visible:
-                                smoother.reset()
-                                person_was_visible = False
-                            shared_bounds['inclination'] = None
-
-                    if active_spine_geom is not None:
-                        vis.add_geometry(active_spine_geom,   reset_bounding_box=False)
-                    if active_outline_geom is not None:
-                        vis.add_geometry(active_outline_geom, reset_bounding_box=False)
-
-                    # ── Render point cloud ─────────────────────────────────────
-                    if len(arr) > 0:
-                        pcd.points = o3d.utility.Vector3dVector(arr)
-                        nd = np.clip(dists / MAX_COLOR_DIST_M, 0.0, 1.0)
-                        colors = np.zeros((len(arr), 3))
-                        colors[:, 0] = np.clip(1.5 - np.abs(4.0 * nd - 3.0), 0, 1)
-                        colors[:, 1] = np.clip(1.5 - np.abs(4.0 * nd - 2.0), 0, 1)
-                        colors[:, 2] = np.clip(1.5 - np.abs(4.0 * nd - 1.0), 0, 1)
-                        pcd.colors = o3d.utility.Vector3dVector(colors)
+                        # Hand off to worker (with bg ref) — returns immediately
+                        _submit_job(arr.copy(), dists.copy(),
+                                    background_pcd, bg_active)
                     else:
-                        pcd.points = o3d.utility.Vector3dVector(np.zeros((0, 3)))
-                        pcd.colors = o3d.utility.Vector3dVector(np.zeros((0, 3)))
-                    vis.update_geometry(pcd)
+                        # No chair filter — clear overlays, show BG-subtracted
+                        # cloud directly.  BG subtraction is kept here (main
+                        # thread) because this path skips all the heavy ops; the
+                        # KD-tree query is the only work and it only runs every
+                        # FRAME_TIME_S seconds, which is acceptable.
+                        if bg_active and len(arr) > 0:
+                            _tmp = o3d.geometry.PointCloud()
+                            _tmp.points = o3d.utility.Vector3dVector(arr)
+                            _d2bg = np.asarray(
+                                _tmp.compute_point_cloud_distance(background_pcd))
+                            arr   = arr[_d2bg > 0.06]
+                            dists = dists[_d2bg > 0.06]
+
+                        if active_spine_geom is not None:
+                            vis.remove_geometry(active_spine_geom,
+                                                reset_bounding_box=False)
+                            active_spine_geom = None
+                        if active_outline_geom is not None:
+                            vis.remove_geometry(active_outline_geom,
+                                                reset_bounding_box=False)
+                            active_outline_geom = None
+                        if person_was_visible:
+                            smoother.reset()
+                            person_was_visible = False
+                        shared_bounds['inclination'] = None
+
+                        if len(arr) > 0:
+                            pcd.points = o3d.utility.Vector3dVector(arr)
+                            nd = np.clip(dists / MAX_COLOR_DIST_M, 0.0, 1.0)
+                            colors = np.zeros((len(arr), 3))
+                            colors[:, 0] = np.clip(1.5 - np.abs(4.0 * nd - 3.0), 0, 1)
+                            colors[:, 1] = np.clip(1.5 - np.abs(4.0 * nd - 2.0), 0, 1)
+                            colors[:, 2] = np.clip(1.5 - np.abs(4.0 * nd - 1.0), 0, 1)
+                            pcd.colors = o3d.utility.Vector3dVector(colors)
+                        else:
+                            pcd.points = o3d.utility.Vector3dVector(np.zeros((0, 3)))
+                            pcd.colors = o3d.utility.Vector3dVector(np.zeros((0, 3)))
+                        vis.update_geometry(pcd)
 
                 accumulated_pts.clear()
-                last_render_time = current_time
+                last_render_time = now
 
-            vis.poll_events()
+            # ── 3. Check for worker results (non-blocking, every ~1 ms) ───────
+            try:
+                res = _result_q.get_nowait()
+            except queue.Empty:
+                res = None
+
+            if res is not None:
+                # Swap geometries: remove old, add new
+                if active_spine_geom is not None:
+                    vis.remove_geometry(active_spine_geom, reset_bounding_box=False)
+                if active_outline_geom is not None:
+                    vis.remove_geometry(active_outline_geom, reset_bounding_box=False)
+
+                active_spine_geom   = res['spine_mesh']
+                active_outline_geom = res['outline_mesh']
+                if active_spine_geom is not None:
+                    vis.add_geometry(active_spine_geom,   reset_bounding_box=False)
+                if active_outline_geom is not None:
+                    vis.add_geometry(active_outline_geom, reset_bounding_box=False)
+
+                # Temporal smoothing stays on main thread (ordered by arrival)
+                raw_inc = res['raw_inc']
+                if raw_inc is not None:
+                    inc = smoother.update(raw_inc)
+                    shared_bounds['inclination'] = inc
+                    print_inclination(inc)
+                    person_was_visible = True
+                else:
+                    if person_was_visible:
+                        smoother.reset()
+                        person_was_visible = False
+                    shared_bounds['inclination'] = None
+
+                # Update point cloud from worker's human-filtered data
+                d_arr   = res['display_arr']
+                d_dists = res['display_dists']
+                if len(d_arr) > 0:
+                    pcd.points = o3d.utility.Vector3dVector(d_arr)
+                    nd = np.clip(d_dists / MAX_COLOR_DIST_M, 0.0, 1.0)
+                    colors = np.zeros((len(d_arr), 3))
+                    colors[:, 0] = np.clip(1.5 - np.abs(4.0 * nd - 3.0), 0, 1)
+                    colors[:, 1] = np.clip(1.5 - np.abs(4.0 * nd - 2.0), 0, 1)
+                    colors[:, 2] = np.clip(1.5 - np.abs(4.0 * nd - 1.0), 0, 1)
+                    pcd.colors = o3d.utility.Vector3dVector(colors)
+                else:
+                    pcd.points = o3d.utility.Vector3dVector(np.zeros((0, 3)))
+                    pcd.colors = o3d.utility.Vector3dVector(np.zeros((0, 3)))
+                vis.update_geometry(pcd)
+
+            # ── 4. FIX 1: Window-close detection ──────────────────────────────
+            # poll_events() returns False when the user closes the O3D window.
+            # Previously this was never checked so the loop ran forever after
+            # the window was dismissed.
+            if not vis.poll_events():
+                break
             vis.update_renderer()
             time.sleep(0.001)
 
     except KeyboardInterrupt:
         pass
     finally:
-        stop_event.set()
+        stop_event.set()  # signals heartbeat + worker threads to exit
         try:
             cam_params = vis.get_view_control().convert_to_pinhole_camera_parameters()
             o3d.io.write_pinhole_camera_parameters("temp_cam_save.json", cam_params)
