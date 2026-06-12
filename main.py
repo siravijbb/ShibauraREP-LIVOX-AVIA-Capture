@@ -2,7 +2,8 @@
 """
 Livox Avia – Direct SDK Viewer
 (Posture Outline + Three-Segment Spine + Option C Inclination
- + Reference Position Capture with Head-Below Tracking)
+ + Reference Position Capture with Head-Below Tracking
+ + Lateral Axis Alerts Enabled)
 """
 
 import os
@@ -45,15 +46,61 @@ CONFIG_FILE  = "roi_settings.json"
 BG_PCD_FILE  = "background_model.pcd"
 SPINE_SLICES = 25
 
-LUMBAR_ALERT_DEG   = 15.0
-FHP_RELATIVE_ALERT = 12.0
+LUMBAR_ALERT_DEG     = 15.0
+FHP_RELATIVE_ALERT   = 12.0
+LUMBAR_LAT_ALERT_DEG = 15.0   # Lateral lumbar threshold (now active)
+FHP_LAT_ALERT_DEG    = 12.0   # Lateral FHP threshold (now active)
+
+# Reclining-on-chair detection
+# If the head is BELOW the reference height AND the upper-spine (FHP) segment
+# is tilted backward past this threshold, the person is leaning on the chair
+# — lumbar alert is suppressed.  If the head drops without backward tilt,
+# the person is slumping forward and the alert fires normally.
+RECLINE_FHP_DEG    = -5.0   # fhp_fwd_deg must be < this (backward) for recline
+RECLINE_LUMBAR_DEG = -3.0   # lumbar_fwd_deg must also be < this to confirm recline
 
 NMS_LAT_THRESH = 0.12
 NMS_ITERATIONS = 2
 
-SMOOTH_WINDOW    = 5
-SMOOTH_Z_THRESH  = 1.5
-SMOOTH_HARD_CLIP = 60.0
+SMOOTH_WINDOW          = 5
+SMOOTH_Z_THRESH        = 1.5
+SMOOTH_HARD_CLIP       = 60.0
+SMOOTH_ENTER_TRACK_DEG = 3.5   # buffer avg must move THIS FAR from last output to unfreeze
+SMOOTH_EXIT_TRACK_DEG  = 1.0   # buffer avg must move LESS THAN this per frame to re-freeze
+SMOOTH_LARGE_DEG       = 12.0  # raw jump ≥ this → snap immediately + flush buffer
+
+# ── Denoising & body-extraction parameters ────────────────────────────────────
+VOXEL_SIZE           = 0.025   # 2.5 cm — normalises Livox non-repetitive density
+DENOISE_NB_NEIGHBORS = 20      # statistical outlier removal: neighbourhood size
+DENOISE_STD_RATIO    = 2.0     # 1.0–1.5 over-removes sparse Livox body pts; keep at 2.0
+HUMAN_HORIZ_RADIUS   = 0.55    # horizontal radius from head centre in X-Y plane;
+                                # 0.35 cuts torso when sensor is side-mounted and body
+                                # depth differs from head by more than 35 cm
+HUMAN_FLOOR_MARGIN   = 0.08    # strip only the bottom 8 cm of person Z range
+                                # (was 0.32 — removed torso when total Z span is ~1 m)
+
+
+def denoise_pointcloud(arr, voxel=True):
+    """
+    Two-stage cleaning:
+      1. Voxel downsample — normalises the Livox non-repetitive scan density
+         so statistical outlier removal works uniformly across the cloud.
+      2. Statistical outlier removal — eliminates isolated flying pixels and
+         scatter that inflate the silhouette outline.
+    Returns a float64 numpy array (may be smaller than input).
+    """
+    if len(arr) < 20:
+        return arr
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(arr)
+    if voxel:
+        pcd = pcd.voxel_down_sample(VOXEL_SIZE)
+    if len(np.asarray(pcd.points)) < 20:
+        return arr                         # fallback: return original if over-thinned
+    pcd, _ = pcd.remove_statistical_outlier(
+        nb_neighbors=DENOISE_NB_NEIGHBORS, std_ratio=DENOISE_STD_RATIO)
+    result = np.asarray(pcd.points, dtype=np.float64)
+    return result if len(result) >= 10 else arr
 
 
 def create_line_cylinders(pts_3d, lines_idx, color, radius=0.018):
@@ -111,26 +158,96 @@ def nms_spine_centroids(spine_pts, lat_thresh=NMS_LAT_THRESH, iterations=NMS_ITE
 
 
 class TemporalSmoother:
+    """
+    Hysteresis (Schmitt-trigger) smoother for posture angles.
+
+    Two separate thresholds stop the "too sensitive vs too frozen" trade-off:
+
+      FREEZE → TRACK   buffer avg moves ≥ SMOOTH_ENTER_TRACK_DEG from last output
+                       → requires a sustained, genuine shift to unfreeze.
+
+      TRACK  → FREEZE  buffer avg moves < SMOOTH_EXIT_TRACK_DEG in one frame
+                       → re-freezes once the person settles at the new position.
+
+      SNAP             raw value jumps ≥ SMOOTH_LARGE_DEG in one frame
+                       → output snaps instantly, buffer flushed.
+
+    Example walk-through (person moves from 0° → 8°):
+      frames 1-2 : avg builds toward 3.5°, still FROZEN          (noise suppressed)
+      frame 3    : avg reaches 3.5° → TRACKING, output follows
+      frames 4-5 : avg climbs 5°→7°→8°, still TRACKING
+      frame 6    : avg stabilises at 8°, frame-delta < 1° → FREEZE at 8°
+      frame 7+   : stationary noise ±2° < enter threshold → stays FROZEN   ✓
+    """
+
     ANGLE_KEYS = (
         "lumbar_fwd_deg", "lumbar_lat_deg",
         "fhp_fwd_deg",    "fhp_lat_deg",
         "relative_fhp_deg",
     )
+    _TRACK_KEYS = ("lumbar_fwd_deg", "lumbar_lat_deg", "fhp_fwd_deg", "fhp_lat_deg")
 
     def __init__(self, window=SMOOTH_WINDOW, z_thresh=SMOOTH_Z_THRESH,
                  hard_clip=SMOOTH_HARD_CLIP):
         self.window    = window
         self.z_thresh  = z_thresh
         self.hard_clip = hard_clip
-        self._bufs = {k: collections.deque(maxlen=window) for k in self.ANGLE_KEYS}
+        self._bufs        = {k: collections.deque(maxlen=window) for k in self.ANGLE_KEYS}
+        self._last_output = {k: None for k in self._TRACK_KEYS}
+        self._tracking    = {k: False for k in self._TRACK_KEYS}
+
+    # ── public ────────────────────────────────────────────────────────────────
 
     def update(self, inc):
         result = dict(inc)
-        for k in ("lumbar_fwd_deg", "lumbar_lat_deg", "fhp_fwd_deg", "fhp_lat_deg"):
-            raw = float(inc.get(k, 0.0))
-            if abs(raw) <= self.hard_clip:
+        for k in self._TRACK_KEYS:
+            raw  = float(inc.get(k, 0.0))
+            last = self._last_output[k]
+
+            # Hard-clip: ignore physically impossible spikes
+            if abs(raw) > self.hard_clip:
+                result[k] = round(last if last is not None else 0.0, 2)
+                continue
+
+            # ── SNAP: large raw jump → instant response ────────────────────────
+            raw_delta = abs(raw - last) if last is not None else float('inf')
+            if raw_delta >= SMOOTH_LARGE_DEG:
+                self._bufs[k].clear()
                 self._bufs[k].append(raw)
-            result[k] = round(self._robust_mean(self._bufs[k]), 2)
+                self._tracking[k]    = False
+                self._last_output[k] = raw
+                result[k] = round(raw, 2)
+                continue
+
+            # Push to buffer for running average
+            self._bufs[k].append(raw)
+            arr = np.array(self._bufs[k], dtype=float)
+            avg = float(np.mean(arr[-self.window:]))
+
+            if last is None:
+                # First frame: initialise
+                self._last_output[k] = avg
+                result[k] = round(avg, 2)
+                continue
+
+            avg_delta = abs(avg - last)
+
+            if not self._tracking[k]:
+                # ── FROZEN: check whether to start tracking ────────────────────
+                if avg_delta >= SMOOTH_ENTER_TRACK_DEG:
+                    self._tracking[k] = True   # genuine movement detected
+                out = last                      # output stays locked until tracking
+            else:
+                # ── TRACKING: follow the average ──────────────────────────────
+                eff = self._effective_window(avg_delta)
+                out = float(np.mean(arr[-eff:]))
+                # Re-freeze once movement per frame drops below exit threshold
+                if avg_delta < SMOOTH_EXIT_TRACK_DEG:
+                    self._tracking[k] = False
+
+            result[k] = round(out, 2)
+            self._last_output[k] = out
+
         result["relative_fhp_deg"] = round(
             result["fhp_fwd_deg"] - result["lumbar_fwd_deg"], 2)
         self._bufs["relative_fhp_deg"].append(result["relative_fhp_deg"])
@@ -139,6 +256,20 @@ class TemporalSmoother:
     def reset(self):
         for buf in self._bufs.values():
             buf.clear()
+        for k in self._TRACK_KEYS:
+            self._last_output[k] = None
+            self._tracking[k]    = False
+
+    # ── private ───────────────────────────────────────────────────────────────
+
+    def _effective_window(self, avg_delta):
+        """Window shrinks from SMOOTH_WINDOW → 1 as movement grows."""
+        if avg_delta <= SMOOTH_ENTER_TRACK_DEG:
+            return self.window
+        if avg_delta >= SMOOTH_LARGE_DEG:
+            return 1
+        t = (avg_delta - SMOOTH_ENTER_TRACK_DEG) / (SMOOTH_LARGE_DEG - SMOOTH_ENTER_TRACK_DEG)
+        return max(1, round(self.window * (1.0 - t)))
 
     def _robust_mean(self, buf):
         if len(buf) == 0: return 0.0
@@ -296,20 +427,58 @@ def extract_spine_and_outline(points):
     return spine_mesh, outline_mesh, inclination
 
 
-def print_inclination(inc):
+def calibrate_inclination(inc, ref):
+    """
+    Returns a copy of `inc` with all angle fields expressed as delta from the
+    reference capture.  3-D landmark fields (bot_pt, mid_pt, top_pt) are kept
+    unchanged so head-below tracking still works correctly.
+
+    If no reference is set, `inc` is returned unmodified.
+    """
+    if ref is None or inc is None:
+        return inc
+    # Reference may store angles at top level or nested under 'inclination'
+    ref_inc = ref if 'lumbar_fwd_deg' in ref else ref.get('inclination')
+    if not ref_inc:
+        return inc
+    cal = dict(inc)
+    for key in ('lumbar_fwd_deg', 'lumbar_lat_deg', 'fhp_fwd_deg', 'fhp_lat_deg'):
+        if key in cal and key in ref_inc:
+            cal[key] = round(float(cal[key]) - float(ref_inc[key]), 2)
+    cal['relative_fhp_deg'] = round(
+        cal.get('fhp_fwd_deg', 0.0) - cal.get('lumbar_fwd_deg', 0.0), 2)
+    return cal
+
+
+def print_inclination(inc, calibrated=False, reclining=False):
     if inc is None: return
     lf, ll = inc["lumbar_fwd_deg"], inc["lumbar_lat_deg"]
     ff, fl = inc["fhp_fwd_deg"],    inc["fhp_lat_deg"]
     rf     = inc["relative_fhp_deg"]
+
+    mode = "  [Δ from ref]" if calibrated else ""
+
+    if reclining:
+        # Backward lean + head below reference → sitting back on chair, not a posture fault
+        print(f"  ↩ Reclining on chair — lumbar alert suppressed{mode}\n"
+              f"  Lumbar  │ Fwd/Back: {lf:+6.1f}°  Lat: {ll:+6.1f}°\n"
+              f"  FHP     │ Fwd/Back: {ff:+6.1f}°  Lat: {fl:+6.1f}°\n"
+              f"  Relative│ Head vs Lumbar: {rf:+6.1f}°")
+        return
+
+    lumbar_bad = abs(lf) > LUMBAR_ALERT_DEG or abs(ll) > LUMBAR_LAT_ALERT_DEG
+    fhp_bad    = abs(rf) > FHP_RELATIVE_ALERT or abs(fl) > FHP_LAT_ALERT_DEG
+
     tag = ""
-    if abs(rf) > FHP_RELATIVE_ALERT and abs(lf) > LUMBAR_ALERT_DEG:
+    if fhp_bad and lumbar_bad:
         tag = "  ⚠ ALERT: Lumbar + Forward-Head"
-    elif abs(rf) > FHP_RELATIVE_ALERT:
+    elif fhp_bad:
         tag = "  ⚠ ALERT: Forward-Head Posture"
-    elif abs(lf) > LUMBAR_ALERT_DEG:
+    elif lumbar_bad:
         tag = "  ⚠ ALERT: Lumbar Lean"
-    print(f"  Lumbar  │ Fwd/Back: {lf:+6.1f}°  Lat(ref): {ll:+6.1f}°\n"
-          f"  FHP     │ Fwd/Back: {ff:+6.1f}°  Lat(ref): {fl:+6.1f}°\n"
+
+    print(f"  Lumbar  │ Fwd/Back: {lf:+6.1f}°  Lat: {ll:+6.1f}°{mode}\n"
+          f"  FHP     │ Fwd/Back: {ff:+6.1f}°  Lat: {fl:+6.1f}°\n"
           f"  Relative│ Head vs Lumbar: {rf:+6.1f}°{tag}")
 
 
@@ -343,8 +512,8 @@ def get_human_indices(points, ransac_iters=300, remove_seat=True):
                 continue
     if best_center is None: return None
     horiz_dist = np.linalg.norm(points[:, :2] - best_center[:2], axis=1)
-    human_mask = ((horiz_dist <= 0.45) & (points[:, 2] <= max_z) &
-                  (points[:, 2] > min_z + 0.32))
+    human_mask = ((horiz_dist <= HUMAN_HORIZ_RADIUS) & (points[:, 2] <= max_z) &
+                  (points[:, 2] > min_z + HUMAN_FLOOR_MARGIN))
     if remove_seat and np.sum(human_mask) > 30:
         seat_mask = human_mask & (points[:, 2] < (min_z + 0.65))
         if np.sum(seat_mask) > 10:
@@ -361,8 +530,6 @@ def get_human_indices(points, ransac_iters=300, remove_seat=True):
 #  Head-below-reference tracking  (runs in main viewer process each frame)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Console log is suppressed once already printed for the same dip,
-# then re-fires when the head recovers and dips again.
 _head_below_prev = False
 
 def _check_head_below_reference(inclination, shared_bounds):
@@ -377,7 +544,6 @@ def _check_head_below_reference(inclination, shared_bounds):
 
     ref = shared_bounds.get('reference_position')
     if ref is None:
-        # No reference set — clear any stale alert
         shared_bounds['head_below_alert'] = False
         shared_bounds['head_delta']       = None
         _head_below_prev = False
@@ -396,7 +562,6 @@ def _check_head_below_reference(inclination, shared_bounds):
     shared_bounds['head_below_alert'] = below
 
     if below:
-        # Log every frame while below so the operator sees live streaming output
         print(
             f"  ⚠ HEAD BELOW REFERENCE │"
             f" Δh={dh:+.3f} m ({abs(dh)*100:.1f} cm dropped) │"
@@ -404,7 +569,6 @@ def _check_head_below_reference(inclination, shared_bounds):
             f" ΔrelFHP={delta['delta_relative_fhp_deg']:+.1f}°"
         )
     elif _head_below_prev:
-        # Head just recovered — log the return-to-normal
         print(
             f"  ✓ HEAD BACK ABOVE REFERENCE │"
             f" Δh={dh:+.3f} m │"
@@ -421,7 +585,7 @@ def _check_head_below_reference(inclination, shared_bounds):
 def roi_control_panel(shared_bounds):
     root = tk.Tk()
     root.title("ROI & Background Panel")
-    root.geometry("370x1130")
+    root.geometry("370x1100")
     root.attributes('-topmost', True)
     root.configure(padx=15, pady=15)
 
@@ -486,8 +650,9 @@ def roi_control_panel(shared_bounds):
     inc_frame = tk.LabelFrame(root, text=" 3. Three-Segment Inclination (Option C) ",
                                font=('Arial', 10, 'bold'), padx=10, pady=5)
     inc_frame.pack(fill="x", pady=5)
-    tk.Label(inc_frame, text="Segment         Fwd/Back    Lat (ref only)",
-             font=('Courier', 8), fg="gray", anchor='w').pack(fill='x')
+    lbl_col_header = tk.Label(inc_frame, text="Segment         Fwd/Back    Lateral",
+             font=('Courier', 8), fg="gray", anchor='w')
+    lbl_col_header.pack(fill='x')
     tk.Frame(inc_frame, height=1, bg="lightgray").pack(fill='x', pady=2)
     lbl_lumbar = tk.Label(inc_frame, text="● Lumbar (bot→mid)    —       —",
                           font=('Courier', 10), fg="black", anchor='w')
@@ -501,10 +666,9 @@ def roi_control_panel(shared_bounds):
     lbl_rel.pack(fill='x')
     lbl_alert = tk.Label(inc_frame, text="", font=('Arial', 10, 'bold'), fg="red")
     lbl_alert.pack(pady=(4, 0))
-    tk.Label(inc_frame,
-             text="⚠ Lat values are reference only — not used in alerts\n"
-                  "   (LiDAR lateral accuracy insufficient for L/R assessment)",
-             font=('Arial', 7), fg="#b08000", anchor='w', justify='left').pack(fill='x', pady=(4, 0))
+    lbl_cal_mode = tk.Label(inc_frame, text="",
+                            font=('Arial', 8, 'italic'), fg="#1565c0", anchor='w')
+    lbl_cal_mode.pack(fill='x', pady=(2, 0))
     tk.Label(inc_frame,
              text=f"Smoothing: {SMOOTH_WINDOW}-frame avg  |  z>{SMOOTH_Z_THRESH}σ cut  |  clip ±{SMOOTH_HARD_CLIP:.0f}°",
              font=('Arial', 7), fg="gray", anchor='w').pack(fill='x', pady=(3, 0))
@@ -549,8 +713,37 @@ def roi_control_panel(shared_bounds):
             lf, ll = inc.get("lumbar_fwd_deg", 0.0), inc.get("lumbar_lat_deg", 0.0)
             ff, fl = inc.get("fhp_fwd_deg",    0.0), inc.get("fhp_lat_deg",    0.0)
             rf     = inc.get("relative_fhp_deg", 0.0)
-            lumbar_bad = abs(lf) > LUMBAR_ALERT_DEG
-            fhp_bad    = abs(rf) > FHP_RELATIVE_ALERT
+
+            ref_active   = shared_bounds.get('reference_position') is not None
+            cal_active   = shared_bounds.get('angle_calibrated', False)
+            head_below   = shared_bounds.get('head_below_alert', False)
+            is_reclining = shared_bounds.get('is_reclining', False)
+
+            if cal_active:
+                # Reference set AND head at/above reference — calibrated mode
+                lbl_col_header.config(
+                    text="Segment   Fwd/Back    Lateral   [Δ ref]")
+                lbl_cal_mode.config(
+                    text="● Calibrated — showing deviation from reference posture",
+                    fg="#1565c0")
+            elif ref_active and head_below:
+                # Reference set BUT head is below it — suspend calibration
+                lbl_col_header.config(
+                    text="Segment         Fwd/Back    Lateral")
+                lbl_cal_mode.config(
+                    text="⚠ Head below reference — showing absolute angles",
+                    fg="orange")
+            else:
+                # No reference set
+                lbl_col_header.config(
+                    text="Segment         Fwd/Back    Lateral")
+                lbl_cal_mode.config(text="")
+
+            # Alert logic — suppressed during reclining
+            lumbar_bad = (abs(lf) > LUMBAR_ALERT_DEG or abs(ll) > LUMBAR_LAT_ALERT_DEG) \
+                         and not is_reclining
+            fhp_bad    = abs(rf) > FHP_RELATIVE_ALERT or abs(fl) > FHP_LAT_ALERT_DEG
+
             lbl_lumbar.config(
                 text=f"● Lumbar (bot→mid)  {lf:+6.1f}°  {ll:+6.1f}°",
                 fg="red" if lumbar_bad else "#b35a00")
@@ -560,7 +753,10 @@ def roi_control_panel(shared_bounds):
             lbl_rel.config(
                 text=f"▲ Relative FHP:  {rf:+6.1f}°",
                 fg="red" if fhp_bad else ("dark orange" if abs(rf) > 6 else "black"))
-            if fhp_bad and lumbar_bad:
+
+            if is_reclining:
+                lbl_alert.config(text="↩ Reclining — lumbar alert suppressed", fg="#7b5ea7")
+            elif fhp_bad and lumbar_bad:
                 lbl_alert.config(text="⚠ Lumbar + Forward-Head detected!", fg="red")
             elif fhp_bad:
                 lbl_alert.config(text="⚠ Forward-Head Posture detected!", fg="red")
@@ -785,9 +981,9 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
     accumulated_pts    = []
     last_render_time   = time.time()
 
-    active_spine_geom     = None
-    active_outline_geom   = None
-    active_ref_geom_container = [None]
+    active_spine_geom          = None
+    active_outline_geom        = None
+    active_ref_geom_container  = [None]
 
     smoother           = TemporalSmoother(SMOOTH_WINDOW, SMOOTH_Z_THRESH, SMOOTH_HARD_CLIP)
     person_was_visible = False
@@ -875,6 +1071,14 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
                         arr   = arr[d2bg > 0.06]
                         dists = dists[d2bg > 0.06]
 
+                    # ── Stage 1 denoise: scene-level voxel + outlier removal ──
+                    if len(arr) > 20:
+                        arr_d = denoise_pointcloud(arr, voxel=True)
+                        if len(arr_d) >= 20:
+                            dists = np.linalg.norm(arr_d, axis=1)
+                            arr   = arr_d
+                        print(f"  [Frame {_frame_count[0]:04d}] After denoise: {len(arr)}")
+
                     chair_state = shared_bounds.get('chair_state', 'idle')
                     if chair_state == 'active' and len(arr) > 20:
                         human_mask = get_human_indices(arr, ransac_iters=50)
@@ -896,28 +1100,68 @@ def live_livox_viewer(shared_bounds, initial_camera=None):
                             else:
                                 arr, dists = arr_h, dists_h
 
+                            # ── Stage 2 denoise: tight body-only pass ─────────
+                            arr_b = denoise_pointcloud(arr, voxel=False)
+                            if len(arr_b) >= 40:
+                                dists = np.linalg.norm(arr_b, axis=1)
+                                arr   = arr_b
+                            print(f"  [Frame {_frame_count[0]:04d}] Body pts: {len(arr)}")
+
                             active_spine_geom, active_outline_geom, inclination = \
                                 extract_spine_and_outline(arr)
 
                             if inclination is not None:
                                 inclination = smoother.update(inclination)
-                                shared_bounds['inclination'] = inclination
-                                print_inclination(inclination)
-                                # ── Head-below tracking (main process console + shared flag)
+
+                                # ── Head-below check runs FIRST on raw angles ──
+                                # so the calibration decision is current-frame accurate.
                                 _check_head_below_reference(inclination, shared_bounds)
+
+                                ref        = shared_bounds.get('reference_position')
+                                head_below = shared_bounds.get('head_below_alert', False)
+
+                                # ── Reclining detection ────────────────────────
+                                # Head below reference + BOTH spine segments leaning
+                                # backward → person is sitting back on the chair.
+                                # Head below + NOT backward → person is slumping forward.
+                                raw_fhp_fwd    = inclination.get('fhp_fwd_deg',    0.0)
+                                raw_lumbar_fwd = inclination.get('lumbar_fwd_deg', 0.0)
+                                is_reclining   = (
+                                    head_below
+                                    and raw_fhp_fwd    < RECLINE_FHP_DEG
+                                    and raw_lumbar_fwd < RECLINE_LUMBAR_DEG
+                                )
+                                shared_bounds['is_reclining'] = is_reclining
+
+                                # Calibration is active only when a reference is set
+                                # AND the head is at or above that reference height.
+                                # While the head is dropped the raw angles are shown
+                                # so the alert still fires on the real absolute lean.
+                                if ref is not None and not head_below:
+                                    inclination_cal = calibrate_inclination(inclination, ref)
+                                    calibrated      = True
+                                else:
+                                    inclination_cal = inclination
+                                    calibrated      = False
+
+                                shared_bounds['inclination']      = inclination_cal
+                                shared_bounds['angle_calibrated'] = calibrated
+                                print_inclination(inclination_cal,
+                                                  calibrated=calibrated,
+                                                  reclining=is_reclining)
                                 person_was_visible = True
                             else:
                                 if person_was_visible:
                                     smoother.reset()
                                     person_was_visible = False
-                                shared_bounds['inclination']     = None
+                                shared_bounds['inclination']      = None
                                 shared_bounds['head_below_alert'] = False
                                 shared_bounds['head_delta']       = None
                         else:
                             if person_was_visible:
                                 smoother.reset()
                                 person_was_visible = False
-                            shared_bounds['inclination']     = None
+                            shared_bounds['inclination']      = None
                             shared_bounds['head_below_alert'] = False
                             shared_bounds['head_delta']       = None
 
@@ -984,12 +1228,14 @@ if __name__ == "__main__":
         except Exception: pass
 
     initial_bounds.update({
-        'bg_state':          'idle',
-        'chair_state':       'idle',
-        'inclination':       None,
+        'bg_state':           'idle',
+        'chair_state':        'idle',
+        'inclination':        None,
         'reference_position': None,
-        'head_delta':        None,
-        'head_below_alert':  False,
+        'head_delta':         None,
+        'head_below_alert':   False,
+        'angle_calibrated':   False,
+        'is_reclining':       False,
     })
 
     with multiprocessing.Manager() as manager:
